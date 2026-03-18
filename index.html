@@ -1,0 +1,2191 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"/>
+  <meta name="mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="توزيع المهام"/>
+  <meta name="theme-color" content="#0d111b"/>
+  <meta name="description" content="نظام إدارة مهام فصائل الحماية المدنية"/>
+  <link rel="manifest" href="manifest.json"/>
+  <link rel="apple-touch-icon" href="icon-192.png"/>
+  <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png"/>
+  <link rel="icon" type="image/png" sizes="512x512" href="icon-512.png"/>
+  <title>توزيع المهام</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    html,body{height:100%;background:#0d111b;overflow-x:hidden}
+    #root{height:100%}
+    #loading{position:fixed;inset:0;background:#0d111b;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;z-index:9999}
+    #loading img{width:88px;height:88px;border-radius:20px;box-shadow:0 8px 28px #0008}
+    #loading span{color:#5a6678;font-family:Arial;font-size:13px}
+    .sp{width:30px;height:30px;border:3px solid #ffffff10;border-top:3px solid #C0392B;border-radius:50%;animation:sp .8s linear infinite}
+    @keyframes sp{to{transform:rotate(360deg)}}
+  </style>
+</head>
+<body>
+  <div id="loading">
+    <img src="icon-192.png" alt=""/>
+    <div class="sp"></div>
+    <span>جاري التحميل...</span>
+  </div>
+  <div id="root"></div>
+  <script>
+    const _w=console.warn;
+    console.warn=function(...a){if(a[0]&&typeof a[0]==='string'&&a[0].includes('Babel'))return;_w.apply(console,a);};
+    if('serviceWorker' in navigator){window.addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{}));}
+  </script>
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useRef } = React;
+
+
+// ─── Constants ────────────────────────────────────────────────────────
+const SQUADS = ["A", "B", "C"];
+const SQUAD_COLORS = {
+  A: { bg: "#C0392B", light: "#E74C3C", glow: "#C0392B33" },
+  B: { bg: "#1565C0", light: "#42A5F5", glow: "#1565C033" },
+  C: { bg: "#1B6B45", light: "#2ECC71", glow: "#1B6B4533" },
+};
+const SQUAD_NAMES = { A: "الفصيلة A", B: "الفصيلة B", C: "الفصيلة C" };
+// A=14/03, B=15/03, C=16/03
+const REFERENCE_DATE = new Date(2026, 2, 14);
+
+function getSquadForDate(date) {
+  const ref = new Date(REFERENCE_DATE); ref.setHours(0,0,0,0);
+  const tgt = new Date(date);            tgt.setHours(0,0,0,0);
+  const diff = Math.floor((tgt - ref) / 86400000);
+  const pos  = ((diff % 3) + 3) % 3;
+  if (pos === 0) return "A";
+  if (pos === 1) return "B";
+  return "C";
+}
+
+// أقرب يوم عمل للفصيلة (اليوم أو أمس أو قبل أمس)
+function getNearestDutyDate(sq) {
+  const today = new Date(); today.setHours(0,0,0,0);
+  for (let i = 0; i <= 2; i++) {
+    const d = new Date(today); d.setDate(today.getDate() - i);
+    if (getSquadForDate(d) === sq) return d;
+  }
+  return today;
+}
+
+function formatDate(date) {
+  const days   = ["الأحد","الإثنين","الثلاثاء","الأربعاء","الخميس","الجمعة","السبت"];
+  const months = ["يناير","فبراير","مارس","أبريل","مايو","يونيو",
+                  "يوليو","أغسطس","سبتمبر","أكتوبر","نوفمبر","ديسمبر"];
+  return `${days[date.getDay()]} ${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}`;
+}
+
+// ─── Smart Distribution Algorithm ────────────────────────────────────
+function buildDistribution(vehicles, sqPersonnel, dateMs, vehicleCounts, vehicleStatus) {
+  const dayIndex = Math.floor(dateMs / 86400000);
+  const cycle    = Math.floor(dayIndex / 3);
+  const rotate   = (arr, n) => {
+    if (!arr.length) return [];
+    const s = ((n % arr.length) + arr.length) % arr.length;
+    return [...arr.slice(s), ...arr.slice(0, s)];
+  };
+  const byRank = r => sqPersonnel.filter(p => p.rank === r);
+
+  // ── Pools ──────────────────────────────────────────────────────
+  const drivers_light = rotate(byRank("سائق وزن خفيف"), cycle);
+  const drivers_heavy = rotate(byRank("سائق وزن ثقيل"), cycle + 7);
+  const agents        = rotate(byRank("عون"),            cycle + 11);
+
+  // ضابط الحراسة: ضابط حاضر → مساعد عند غياب الضابط
+  const activeOfficers   = [...byRank("ضابط")];
+  const activeAssistants = [...byRank("مساعد")];
+  const guardOfficer = activeOfficers.length
+    ? rotate(activeOfficers, cycle + 2)[cycle % activeOfficers.length]
+    : (activeAssistants.length ? rotate(activeAssistants, cycle + 2)[cycle % activeAssistants.length] : null);
+  const guardOfficerIsAssistant = guardOfficer && guardOfficer.rank === "مساعد";
+
+  // officers pool للشاحنات: ضباط + المساعد إذا كان يعمل كضابط حراسة (يُعامل كضابط)
+  const officers = guardOfficerIsAssistant
+    ? rotate([...byRank("ضابط"), guardOfficer], cycle + 2)
+    : rotate(byRank("ضابط"), cycle + 2);
+
+  // مكتب الحراسة يُعامل كشاحنة إضافية في حساب النقص
+  const allSgts = [
+    ...byRank("رقيب"),
+    // المساعد يدخل pool الرقباء فقط إذا لم يكن يعمل كضابط حراسة
+    ...byRank("مساعد").filter(p => !guardOfficerIsAssistant || p.id !== guardOfficer?.id),
+  ];
+  const dailySgt      = allSgts.length
+    ? rotate(allSgts, cycle + 5)[(cycle + 1) % allSgts.length]
+    : null;
+  // الرقباء للشاحنات = الكل ناقص الرقيب اليومي (المحجوز لمكتب الحراسة)
+  const sgtsForTrucks = rotate(
+    allSgts.filter(p => p.id !== dailySgt?.id), cycle + 5
+  );
+
+  // عرفاء الشاحنات محجوزون أولاً
+  const activeTrucks     = vehicles.filter(v => v.type === "تدخل" && vehicleStatus[v.id] !== false);
+  const truckCorpNeeded  = activeTrucks.reduce((s,v) => s + ((vehicleCounts[v.id]||{}).corporals ?? 1), 0);
+  const allCorp          = rotate(byRank("عريف"), cycle + 3);
+  const corpForTrucks    = allCorp.slice(0, truckCorpNeeded);
+  const corpForAmbulance = allCorp.slice(truckCorpNeeded);
+
+  // ── Driver allocation strategy ────────────────────────────────
+  // الاستراتيجية: حجز الخفاف للإسعاف أولاً كاملاً، VL يأخذ ما تبقى وإلا ثقيل
+  const amb03      = vehicles.find(v => v.type === "إسعاف" && v.name.includes("03"));
+  const activeAmb  = vehicles.filter(v => v.type === "إسعاف" && vehicleStatus[v.id] !== false);
+  const activeVL   = vehicles.filter(v => v.type === "VL"    && vehicleStatus[v.id] !== false);
+  const trucks     = [...activeTrucks].sort((a,b) => a.name.localeCompare(b.name, "ar"));
+
+  // قسّم سائقي الخفيف: أول nAmb منهم للإسعاف، الباقي لـ VL
+  const nAmb         = activeAmb.length;
+  const lightForAmb  = drivers_light.slice(0, nAmb);   // حصة الإسعاف
+  const lightForVL   = drivers_light.slice(nAmb);       // ما تبقى لـ VL
+
+  // ترتيب الإسعاف: كل الإسعاف مرتبة بالاسم (01→02→03→04)
+  // إسعاف 03 يُوضع آخراً حتى يكون أول من يأخذ ثقيل عند النقص
+  const regularAmb = activeAmb
+    .filter(v => v.id !== amb03?.id)
+    .sort((a,b) => a.name.localeCompare(b.name, "ar"));
+  const orderedAmb = [...regularAmb, ...(amb03 && vehicleStatus[amb03.id] !== false ? [amb03] : [])];
+
+  // ── Build dist ────────────────────────────────────────────────
+  const dist = {};
+
+  // OFF vehicles
+  vehicles.filter(v => vehicleStatus[v.id] === false).forEach(v => {
+    dist[v.id] = { driver: null, chief: null, crew: [] };
+  });
+
+  // الإسعاف: كل واحد يأخذ خفيفاً من حصته، إسعاف 03 يأخذ ثقيل عند النقص
+  const usedAmb = new Set();
+  const pickAmb = pool => { const p = pool.find(x => !usedAmb.has(x.id)); if (p) usedAmb.add(p.id); return p || null; };
+  const pickNAmb = (pool, n) => Array.from({length:n}, () => pickAmb(pool)).filter(Boolean);
+
+  orderedAmb.forEach(v => {
+    const cfg    = vehicleCounts[v.id] || {};
+    const isA03  = amb03 && v.id === amb03.id;
+    // إسعاف عادي: خفيف من حصة الإسعاف فقط
+    // إسعاف 03: خفيف من حصة الإسعاف، وإلا ثقيل
+    const driver = isA03
+      ? (pickAmb(lightForAmb) || pickAmb(drivers_heavy))
+      : pickAmb(lightForAmb);
+    dist[v.id] = {
+      driver,
+      chief: pickAmb(corpForAmbulance),
+      crew:  pickNAmb(agents, cfg.agents ?? 1),
+    };
+  });
+
+  // VL: ما تبقى من خفيف بعد الإسعاف، وإلا ثقيل
+  const usedVL = new Set([...usedAmb]);
+  const pickVL = pool => { const p = pool.find(x => !usedVL.has(x.id)); if (p) usedVL.add(p.id); return p || null; };
+
+  activeVL.forEach(v => {
+    dist[v.id] = {
+      driver: pickVL(lightForVL) || pickVL(drivers_heavy),
+      crew:   [],
+    };
+  });
+
+  // الشاحنات
+  const usedAll = new Set([...usedAmb, ...usedVL]);
+  const pick  = pool => { const p = pool.find(x => !usedAll.has(x.id)); if (p) usedAll.add(p.id); return p || null; };
+  const pickN = (pool, n) => Array.from({length:n}, () => pick(pool)).filter(Boolean);
+
+  const sgCount         = sgtsForTrucks.length;
+  const officerNeeded   = trucks.length > 0 && sgCount < trucks.length;
+  let officerUsed       = false;
+
+  trucks.forEach(v => {
+    const cfg  = vehicleCounts[v.id] || {};
+    const corp = pickN(corpForTrucks, cfg.corporals ?? 1);
+    const ag   = pickN(agents,        cfg.agents    ?? 1);
+    const ti   = trucks.indexOf(v);
+    let chief;
+    if (officerNeeded && ti === 0 && !officerUsed) {
+      // نقص رقباء: الضابط في الشاحنة 01 فقط
+      const off = officers[0];
+      if (off) { chief = off; officerUsed = true; }
+      else chief = pick(sgtsForTrucks);
+    } else {
+      // رقيب عادي من pool — null إذا نفد الكل (الرقيب اليومي لا يُلمس)
+      chief = pick(sgtsForTrucks);
+    }
+    dist[v.id] = {
+      driver: pick(drivers_heavy) || pick(drivers_light),
+      chief:  chief || null,
+      crew:   [...corp, ...ag],
+    };
+  });
+
+  return { dist, dailySgtId: dailySgt?.id };
+}
+
+// ─── Auto Guard Assignment ────────────────────────────────────────────
+function buildGuardAssignment(periods, sqPersonnel, cycle, distribution, vehicles) {
+  const rotate = (arr, n) => {
+    if (!arr.length) return [];
+    const s = ((n % arr.length) + arr.length) % arr.length;
+    return [...arr.slice(s), ...arr.slice(0, s)];
+  };
+
+  // الأعوان يملؤون الحراسة — العرفاء بديل عند النقص
+  const agents      = rotate(sqPersonnel.filter(p => p.rank === "عون"),  cycle + 17);
+  const allCorp     = rotate(sqPersonnel.filter(p => p.rank === "عريف"), cycle + 19);
+
+  // عريف إسعاف 01 آخر من يُستدعى للحراسة
+  const amb01 = vehicles ? vehicles.find(v => v.type === "إسعاف" && v.name.includes("01")) : null;
+  const amb01Ids = new Set();
+  if (amb01 && distribution?.[amb01.id]) {
+    const d = distribution[amb01.id];
+    if (d.chief && sqPersonnel.find(p => p.id === d.chief.id && p.rank === "عريف")) amb01Ids.add(d.chief.id);
+    (d.crew || []).forEach(p => {
+      if (sqPersonnel.find(x => x.id === p.id && x.rank === "عريف")) amb01Ids.add(p.id);
+    });
+  }
+  const corporals = [
+    ...allCorp.filter(p => !amb01Ids.has(p.id)),
+    ...allCorp.filter(p =>  amb01Ids.has(p.id)),
+  ];
+
+  const usedG = new Set();
+  const pick  = pool => { const p = pool.find(x => !usedG.has(x.id)); if (p) usedG.add(p.id); return p || null; };
+
+  // result[i] = { id1, id2 }
+  const result = Array.from({length: periods.length}, () => ({ id1: null, id2: null }));
+
+  // Pass 1: أعوان — يملؤون الفترات الوسطى أولاً (تبقى 08:00 و18:00 للعرفاء عند النقص)
+  [1, 2, 3, 4, 0, 5].forEach(idx => {
+    const p1 = pick(agents);
+    if (p1) result[idx].id1 = p1.id;
+    // فترة بحارسين: العون الثاني أو عريف
+    if (periods[idx]?.count === 2) {
+      const p2 = pick(agents) || pick(corporals);
+      if (p2) result[idx].id2 = p2.id;
+    }
+  });
+
+  // Pass 2: عرفاء يملؤون الفترات الفارغة — أولوية 08:00 ثم 18:00 ثم الباقي
+  [0, 5, 1, 2, 3, 4].forEach(idx => {
+    if (result[idx].id1 === null) {
+      const p = pick(corporals);
+      if (p) result[idx].id1 = p.id;
+    }
+  });
+
+  return result;
+}
+
+
+
+const VEHICLE_TYPES = [
+  { key:"VL",       label:"سيارات VL",        icon:"🚗", color:"#F59E0B" },
+  { key:"إسعاف",    label:"سيارات إسعاف",     icon:"🚑", color:"#1A6DFF" },
+  { key:"تدخل",     label:"شاحنات تدخل",      icon:"🚒", color:"#FF4B2B" },
+];
+
+const VEHICLES_INIT = [
+  { id:1, name:"VL 01",              type:"VL",    icon:"🚗", color:"#F59E0B" },
+  { id:2, name:"إسعاف 01",           type:"إسعاف", icon:"🚑", color:"#1A6DFF" },
+  { id:3, name:"إسعاف 02",           type:"إسعاف", icon:"🚑", color:"#1A6DFF" },
+  { id:4, name:"إسعاف 03",           type:"إسعاف", icon:"🚑", color:"#1A6DFF" },
+  { id:5, name:"إسعاف 04",           type:"إسعاف", icon:"🚑", color:"#1A6DFF" },
+  { id:6, name:"شاحنة تدخل 01",      type:"تدخل",  icon:"🚒", color:"#FF4B2B" },
+  { id:7, name:"شاحنة تدخل 02",      type:"تدخل",  icon:"🚒", color:"#FF4B2B" },
+  { id:8, name:"شاحنة تدخل 03",      type:"تدخل",  icon:"🚒", color:"#FF4B2B" },
+];
+
+const RANKS     = ["ضابط","مساعد","رقيب","عريف","عون","سائق وزن خفيف","سائق وزن ثقيل"];
+const RANK_COLORS = {
+  "ضابط":          "#D4AC0D",
+  "مساعد":          "#2E86C1",
+  "رقيب":           "#2980B9",
+  "عريف":           "#7D3C98",
+  "عون":            "#566573",
+  "سائق وزن خفيف": "#10B981",
+  "سائق وزن ثقيل": "#EF4444",
+};
+const ROLES_LIST= ["قائد الفصيلة","نائب القائد","سائق إطفاء","سائق إسعاف","سائق قيادة","مسعف","عنصر إطفاء","عنصر حراسة","مسؤول لوجستي"];
+const INCIDENT_TYPES = [
+  { key:"حريق",     icon:"🔥", color:"#E74C3C" },
+  { key:"إسعاف",    icon:"🚑", color:"#3498DB" },
+  { key:"إنقاذ",    icon:"⛑️", color:"#F39C12" },
+  { key:"مناورة",   icon:"🎯", color:"#9B59B6" },
+  { key:"صيانة",    icon:"🔧", color:"#7F8C8D" },
+  { key:"أخرى",     icon:"📋", color:"#566573" },
+];
+
+function makePersonnel() {
+  const names = {
+    A: ["أحمد بن علي","محمد الزهراني","خالد العمري","سلطان الغامدي","فهد الحربي",
+        "عمر الشهري","ناصر القحطاني","بدر السهلي","حمد المالكي","رائد الدوسري",
+        "وليد الشمري","زياد التميمي","طارق البلوي","سعود العنزي","ماجد الرشيدي",
+        "يزيد الجهني","حسن المطيري","علي البقمي","نواف الحارثي","عبدالله الزهراني",
+        "إبراهيم السلمي","صالح القرني","كريم العتيبي","جاسم المنصور","فيصل الحميد",
+        "سامي الرويلي","خالد السبيعي","عبدالرحمن الدغيلبي"],
+    B: ["يوسف المالكي","إبراهيم القحطاني","عبدالله الدوسري","نواف البلوي","طارق العنزي",
+        "حمد الرشيدي","سامي الغامدي","أنس الحربي","فيصل الشهري","جابر العمري",
+        "منصور السهلي","رشيد المالكي","وليد الزهراني","خالد التميمي","أحمد البلوي",
+        "محمد القحطاني","عمر الرشيدي","ناصر الجهني","سعد المطيري","بدر البقمي",
+        "حسين الحارثي","زياد السلمي","عادل الشمري","ريان العنزي","هاني الزهراني",
+        "فارس القرني","لؤي الغامدي","جمال الحربي"],
+    C: ["سعد التميمي","علي الجهني","وليد المطيري","راشد البقمي","زياد الزهراني",
+        "بندر الحارثي","عادل السلمي","ريان القرني","هاني الغامدي","فارس الحربي",
+        "قاسم الشهري","لؤي العمري","كريم السهلي","جمال المالكي","شادي الدوسري",
+        "أيمن البلوي","رامي العنزي","عمار الرشيدي","سيف الجهني","حارث المطيري",
+        "نايف البقمي","صقر الحارثي","ماهر الشهري","نزار الدوسري","طلال العمري",
+        "وليد البلوي","حمزة القحطاني","يزيد الزهراني"],
+  };
+  // ملازم(1) مساعد(1) رقيب(4) عريف(7) سائق خفيف(5) سائق ثقيل(4) عون(6) = 28
+  const rankMap = [
+    "ضابط",                                                              // 0
+    "مساعد",                                                              // 1
+    "رقيب","رقيب","رقيب","رقيب",                                         // 2-5
+    "عريف","عريف","عريف","عريف","عريف","عريف","عريف",                    // 6-12
+    "سائق وزن خفيف","سائق وزن خفيف","سائق وزن خفيف","سائق وزن خفيف","سائق وزن خفيف", // 13-17
+    "سائق وزن ثقيل","سائق وزن ثقيل","سائق وزن ثقيل","سائق وزن ثقيل",   // 18-21
+    "عون","عون","عون","عون","عون","عون",                                  // 22-27
+  ];
+  const roleMap = rankMap.map(r => r);
+  const vehMap  = new Array(28).fill(null);
+  const data = {};
+  SQUADS.forEach((sq, si) => {
+    data[sq] = names[sq].map((name, i) => ({
+      id: (si+1)*100 + i + 1,
+      name, rank: rankMap[i] || "عون", role: roleMap[i] || "عون", vehicleId: vehMap[i],
+    }));
+  });
+  return data;
+}
+
+const GUARD_INIT = [
+  { id:1, period:"الفترة الأولى",   time:"08:00 – 10:00", guardId:null, guardId2:null, count:1 },
+  { id:2, period:"الفترة الثانية",  time:"10:00 – 12:00", guardId:null, guardId2:null, count:1 },
+  { id:3, period:"الفترة الثالثة", time:"12:00 – 14:00", guardId:null, guardId2:null, count:1 },
+  { id:4, period:"الفترة الرابعة",  time:"14:00 – 16:00", guardId:null, guardId2:null, count:1 },
+  { id:5, period:"الفترة الخامسة", time:"16:00 – 18:00", guardId:null, guardId2:null, count:1 },
+  { id:6, period:"الفترة السادسة",  time:"18:00 – 20:00", guardId:null, guardId2:null, count:1 },
+];
+
+const inputSt = {
+  width:"100%", background:"#252d3f", border:"1px solid #e2e6ed",
+  color:"#e8ecf1", borderRadius:10, padding:"10px 13px", fontSize:13,
+  direction:"rtl", outline:"none", fontFamily:"'Cairo',sans-serif", display:"block",
+};
+
+// ─── Sub-components ───────────────────────────────────────────────────
+function Badge({ sq, size="md" }) {
+  const c = SQUAD_COLORS[sq];
+  const d = { sm:26, md:38, lg:52 }[size];
+  const f = { sm:11, md:15, lg:22 }[size];
+  return (
+    <div style={{
+      width:d, height:d, borderRadius:"50%", flexShrink:0,
+      background:`linear-gradient(135deg,${c.bg},${c.light})`,
+      display:"flex", alignItems:"center", justifyContent:"center",
+      fontSize:f, fontWeight:900, color:"#fff",
+      boxShadow:`0 3px 10px ${c.glow}`,
+    }}>{sq}</div>
+  );
+}
+
+function Sheet({ title, onClose, children }) {
+  return (
+    <div style={{
+      position:"fixed", inset:0, background:"rgba(0,0,0,0.8)", zIndex:200,
+      display:"flex", alignItems:"flex-end", backdropFilter:"blur(8px)",
+    }} onClick={onClose}>
+      <div style={{
+        background:"#252d3f", borderRadius:"22px 22px 0 0", width:"100%",
+        maxWidth:480, margin:"0 auto", maxHeight:"88vh", display:"flex",
+        flexDirection:"column", boxShadow:"0 -12px 60px #000c",
+      }} onClick={e => e.stopPropagation()}>
+        <div style={{ display:"flex", justifyContent:"center", padding:"10px 0 2px" }}>
+          <div style={{ width:36, height:4, background:"#222840", borderRadius:2 }}/>
+        </div>
+        <div style={{
+          display:"flex", justifyContent:"space-between", alignItems:"center",
+          padding:"10px 20px", borderBottom:"1px solid #e2e6ed",
+        }}>
+          <h2 style={{ color:"#e8ecf1", fontSize:16, fontWeight:700, margin:0 }}>{title}</h2>
+          <button onClick={onClose} style={{
+            background:"#222840", border:"none", color:"#7a8799",
+            width:32, height:32, borderRadius:"50%", cursor:"pointer", fontSize:18,
+          }}>×</button>
+        </div>
+        <div style={{ overflowY:"auto", padding:"16px 18px 44px", direction:"rtl" }}>
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Shift Key ───────────────────────────────────────────────────────
+function shiftKey(date, squad) {
+  const d = new Date(date); d.setHours(0,0,0,0);
+  return `shift_${squad}_${d.getFullYear()}_${d.getMonth()+1}_${d.getDate()}`;
+}
+function saveShift(key, data) {
+  try { localStorage.setItem(key, JSON.stringify(data)); } catch(e) {}
+}
+function loadShift(key) {
+  try { const r = localStorage.getItem(key); return r ? JSON.parse(r) : null; } catch(e) { return null; }
+}
+function savePersonnel(data) {
+  try { localStorage.setItem('koudja_personnel', JSON.stringify(data)); } catch(e) {}
+}
+function loadPersonnel() {
+  try { const r = localStorage.getItem('koudja_personnel'); return r ? JSON.parse(r) : null; } catch(e) { return null; }
+}
+function saveVehicles(data) {
+  try { localStorage.setItem('koudja_vehicles', JSON.stringify(data)); } catch(e) {}
+}
+function loadVehicles() {
+  try { const r = localStorage.getItem('koudja_vehicles'); return r ? JSON.parse(r) : null; } catch(e) { return null; }
+}
+function MainApp() {
+
+  const [date,        setDate]        = useState(() => { const t=new Date(); t.setHours(0,0,0,0); return t; });
+  const [autoSquad,   setAutoSquad]   = useState(() => getSquadForDate(new Date()));
+  const [manualSquad, setManualSquad] = useState(() => getSquadForDate(new Date()));
+  const [personnel,   setPersonnel]   = useState(() => loadPersonnel() || makePersonnel());
+  const [vehicles,    setVehicles]    = useState(() => loadVehicles()   || VEHICLES_INIT);
+  const [guards,      setGuards]      = useState(GUARD_INIT);
+  const [modal,       setModal]       = useState(null);
+  const [editSq,      setEditSq]      = useState(() => getSquadForDate(new Date()));
+  const [gPicker,     setGPicker]     = useState(null);
+  const [pName, setPName] = useState("");
+  const [pRank, setPRank] = useState(RANKS[4]); // عون افتراضياً
+  const [pRole, setPRole] = useState(ROLES_LIST[6]);
+  const [pVeh,  setPVeh]  = useState("");
+  const [vName, setVName] = useState("");
+  const [vType, setVType] = useState("VL");
+  const [guardOffice, setGuardOffice] = useState({ officer:"", sergeant:"" });
+  const [editGuardOffice, setEditGuardOffice] = useState(false);
+  const [showAddVehicle, setShowAddVehicle] = useState(false);
+  const [confirmDeleteVehicle, setConfirmDeleteVehicle] = useState(null);
+  const [showAddPerson, setShowAddPerson] = useState(false);
+  const [editingPerson, setEditingPerson] = useState(null);
+  const [attPopup, setAttPopup] = useState(null); // {id, x, y}
+  const [vacDays,  setVacDays]  = useState(30);
+  const [confirmDelete, setConfirmDelete] = useState(null);
+  const [dragId, setDragId] = useState(null);
+  const [dragOverId, setDragOverId] = useState(null);
+  const [vehicleCounts,  setVehicleCounts]  = useState({});
+  const [distribution,   setDistribution]   = useState(null);
+  const [dailySgtId,     setDailySgtId]     = useState(null);
+  const [attendance,     setAttendance]     = useState({});
+  const [vehicleStatus,  setVehicleStatus]  = useState({});
+  const currentShiftKey = useRef("");
+  const [shiftNote,       setShiftNote]      = useState("");
+  const [incidents,       setIncidents]      = useState([]); // [{id, time, type, desc}]
+  const [showIncident,    setShowIncident]   = useState(false);
+  const [incType,         setIncType]        = useState("حريق");
+  const [incDesc,         setIncDesc]        = useState("");
+  const [editVehicleId,   setEditVehicleId]  = useState(null);
+  const [editVehicleName, setEditVehicleName]= useState("");
+
+  useEffect(() => {
+    if (!manualSquad) setAutoSquad(getSquadForDate(date));
+  }, [date, manualSquad]);
+
+  const isSwitchingShift = useRef(false);
+
+  // ── Refs يجب تعريفها قبل أي useEffect يستخدمها ──────────────────────────
+  const attendanceRef     = useRef(attendance);
+  const vehicleStatusRef  = useRef(vehicleStatus);
+  const vehicleCountsRef  = useRef(vehicleCounts);
+  const shiftNoteRef      = useRef(shiftNote);
+  const incidentsRef      = useRef(incidents);
+  const guardsRef         = useRef(guards);
+  const personnelRef      = useRef(personnel);
+  const vehiclesRef       = useRef(vehicles);
+
+  // ── مزامنة الـ Refs دائماً مع أحدث قيمة ─────────────────────────────────
+  useEffect(() => { attendanceRef.current    = attendance;    }, [attendance]);
+  useEffect(() => { vehicleStatusRef.current = vehicleStatus; }, [vehicleStatus]);
+  useEffect(() => { vehicleCountsRef.current = vehicleCounts; }, [vehicleCounts]);
+  useEffect(() => { shiftNoteRef.current     = shiftNote;     }, [shiftNote]);
+  useEffect(() => { incidentsRef.current     = incidents;     }, [incidents]);
+  useEffect(() => { guardsRef.current        = guards;        }, [guards]);
+  useEffect(() => { personnelRef.current     = personnel;     }, [personnel]);
+  useEffect(() => { vehiclesRef.current      = vehicles;      }, [vehicles]);
+
+  // ── Helper: بناء كائن الحفظ من الـ Refs ──────────────────────────────────
+  const buildSaveData = () => ({
+    attendance:   attendanceRef.current,
+    vehicleStatus:vehicleStatusRef.current,
+    vehicleCounts:vehicleCountsRef.current,
+    shiftNote:    shiftNoteRef.current,
+    incidents:    incidentsRef.current,
+    guardIds:     guardsRef.current.map(g => g.guardId),
+    guardIds2:    guardsRef.current.map(g => g.guardId2),
+    guardCounts:  guardsRef.current.map(g => g.count),
+  });
+
+  // ── تبديل الوردية: حفظ الحالية وتحميل الجديدة ───────────────────────────
+  useEffect(() => {
+    const sq  = manualSquad || getSquadForDate(date);
+    const key = shiftKey(date, sq);
+    if (key === currentShiftKey.current) return;
+
+    // حفظ الوردية السابقة قبل الانتقال
+    if (currentShiftKey.current) {
+      saveShift(currentShiftKey.current, buildSaveData());
+    }
+
+    isSwitchingShift.current = true;
+    const saved = loadShift(key);
+
+    if (saved) {
+      // وردية محفوظة سابقاً — استعادة كل البيانات
+      setAttendance(saved.attendance    || {});
+      setVehicleStatus(saved.vehicleStatus || {});
+      setVehicleCounts(saved.vehicleCounts || {});
+      setShiftNote(saved.shiftNote || "");
+      setIncidents(saved.incidents || []);
+      if (saved.guardIds) {
+        setGuards(prev => prev.map((g, i) => ({
+          ...g,
+          guardId:  saved.guardIds?.[i]  ?? null,
+          guardId2: saved.guardIds2?.[i] ?? null,
+          count:    saved.guardCounts?.[i] ?? 1,
+        })));
+      }
+    } else {
+      // وردية جديدة — نقل العطل النشطة فقط من الوردية السابقة
+      const prevKey = (() => {
+        const sq2 = manualSquad || getSquadForDate(date);
+        const d = new Date(date); d.setDate(d.getDate() - 3);
+        return shiftKey(d, sq2);
+      })();
+      const prevSaved = loadShift(prevKey);
+      const carriedAttendance = {};
+      if (prevSaved?.attendance) {
+        const curShift = Math.floor(new Date(date).setHours(0,0,0,0) / (86400000*3));
+        Object.entries(prevSaved.attendance).forEach(([id, s]) => {
+          if (s && s.vacation) {
+            const endShift = s.startShift + Math.ceil(s.days/3);
+            if (curShift < endShift) carriedAttendance[id] = s;
+          }
+        });
+      }
+      setAttendance(carriedAttendance);
+      setVehicleStatus({});
+      setVehicleCounts({});
+      setShiftNote("");
+      setIncidents([]);
+      setGuards(prev => prev.map(g => ({ ...g, guardId:null, guardId2:null, count:1 })));
+    }
+
+    currentShiftKey.current = key;
+    // نعطي React وقتاً كافياً لإتمام كل الـ setState قبل السماح بالحفظ التلقائي
+    setTimeout(() => { isSwitchingShift.current = false; }, 300);
+  }, [date, manualSquad]);
+
+  // ── حفظ الأفراد والمركبات عند أي تغيير (مستقل عن الوردية) ──────────────
+  useEffect(() => { savePersonnel(personnel); }, [personnel]);
+  useEffect(() => { saveVehicles(vehicles);   }, [vehicles]);
+
+  // ── حفظ عند إغلاق التطبيق أو إعادة التحميل ─────────────────────────────
+  useEffect(() => {
+    const handleUnload = () => {
+      if (currentShiftKey.current) saveShift(currentShiftKey.current, buildSaveData());
+      savePersonnel(personnelRef.current);
+      saveVehicles(vehiclesRef.current);
+    };
+    window.addEventListener('beforeunload', handleUnload);
+    window.addEventListener('pagehide', handleUnload); // مهم لـ iOS/PWA
+    return () => {
+      window.removeEventListener('beforeunload', handleUnload);
+      window.removeEventListener('pagehide', handleUnload);
+    };
+  }, []);
+
+  // ── Auto-save عند أي تغيير ────────────────────────────────────────────────
+  useEffect(() => {
+    if (!currentShiftKey.current || isSwitchingShift.current) return;
+    saveShift(currentShiftKey.current, buildSaveData());
+  }, [attendance, vehicleStatus, vehicleCounts, shiftNote, incidents, guards]);
+
+  // Rebuild distribution when anything relevant changes
+  useEffect(() => {
+    const sq  = manualSquad || getSquadForDate(date);
+    const vd2 = new Date(date); vd2.setHours(0,0,0,0);
+    const dayIndex = Math.floor(vd2.getTime() / 86400000);
+    const cycle    = Math.floor(dayIndex / 3);
+    const sqP = (personnel[sq] || []).filter(p => {
+      const s = attendance[p.id];
+      if (s === false) return false;
+      if (s && s.vacation) {
+        const curShift = Math.floor(vd2.getTime()/(86400000*3));
+        if (curShift < s.startShift + Math.ceil(s.days/3)) return false;
+      }
+      return true;
+    });
+
+    const { dist, dailySgtId: newDailySgtId } = buildDistribution(vehicles, sqP, vd2.getTime(), vehicleCounts, vehicleStatus);
+    setDistribution(dist);
+    setDailySgtId(newDailySgtId ?? null);
+
+    const guardPairs = buildGuardAssignment(guards, sqP, cycle, dist, vehicles);
+    setGuards(prev => prev.map((g, i) => ({
+      ...g,
+      guardId:  guardPairs[i]?.id1 ?? null,
+      guardId2: guardPairs[i]?.id2 ?? null,
+    })));
+  }, [date, manualSquad, personnel, vehicles, vehicleCounts, attendance, vehicleStatus]);
+
+  // ── Vacation return alerts ───────────────────────────────────────────────
+  const getVacationAlerts = () => {
+    const sq = manualSquad || autoSquad;
+    const members = personnel[sq] || [];
+    const alerts = [];
+    members.forEach(p => {
+      const s = attendance[p.id];
+      if (!s || !s.vacation) return;
+      const curShift = Math.floor(new Date(date).setHours(0,0,0,0) / (86400000*3));
+      const endShift = s.startShift + Math.ceil(s.days/3);
+      const remaining = endShift - curShift;
+      if (remaining === 1) alerts.push({ name:p.name, type:'next' });   // يعود الوردية القادمة
+      if (remaining === 0) alerts.push({ name:p.name, type:'today' });  // يعود اليوم
+    });
+    return alerts;
+  };
+
+    const squad       = manualSquad || autoSquad;
+  const sc          = SQUAD_COLORS[squad];
+  const sqPersonnel = personnel[squad] || [];
+
+  const today = new Date(); today.setHours(0,0,0,0);
+  const vd    = new Date(date); vd.setHours(0,0,0,0);
+  const isToday = vd.getTime() === today.getTime();
+
+  const goNext = () => {
+    const nextD = new Date(date); nextD.setDate(nextD.getDate() + 3);
+    // الحد: 5 ورديات قادمة من اليوم
+    const todayNorm = new Date(); todayNorm.setHours(0,0,0,0);
+    let count = 0;
+    let futureLimit = null;
+    for (let i = 1; i <= 20 && count < 5; i++) {
+      const d = new Date(todayNorm); d.setDate(todayNorm.getDate() + i);
+      if (getSquadForDate(d) === squad) { futureLimit = d; count++; }
+    }
+    if (!futureLimit || nextD <= futureLimit) setDate(nextD);
+  };
+
+  const goPrev = () => {
+    const nearest = getNearestDutyDate(squad);
+    const minDate = new Date(nearest); minDate.setDate(nearest.getDate() - 10 * 3);
+    const prevD = new Date(date); prevD.setDate(prevD.getDate() - 3);
+    if (prevD >= minDate) setDate(prevD);
+  };
+
+  const getName  = id => {
+    for (const s of SQUADS) {
+      const p = personnel[s].find(x => x.id===id);
+      if (p) return p.name;
+    }
+    return null;
+  };
+  const getPersonByIdPresent = id => {
+    for (const s of SQUADS) {
+      const p = personnel[s].find(x => x.id===id);
+      if (p && isPresent(p.id)) return p;
+    }
+    return null;
+  };
+
+  const getPrevGuardIds = () => {
+    const sq = manualSquad || getSquadForDate(date);
+    const prevDate = new Date(date); prevDate.setDate(prevDate.getDate() - 3);
+    const saved = loadShift(shiftKey(prevDate, sq));
+    if (!saved) return new Set();
+    const ids = new Set([
+      ...(saved.guardIds  || []).filter(Boolean),
+      ...(saved.guardIds2 || []).filter(Boolean),
+    ]);
+    return ids;
+  };
+  const vCrew    = vId => sqPersonnel.filter(p => p.vehicleId === vId);
+
+  const addPerson = () => {
+    if (!pName.trim()) return;
+    const fullName = pRole.trim() ? `${pName.trim()} ${pRole.trim()}` : pName.trim();
+    setPersonnel(prev => ({ ...prev, [squad]: [...prev[squad], {
+      id: Date.now(), name: fullName, rank: pRank, role: "", vehicleId: null,
+    }]}));
+    setPName(""); setPRole("");
+  };
+  const delPerson  = (sq, id) => setPersonnel(prev => ({ ...prev, [sq]: prev[sq].filter(p => p.id !== id) }));
+
+  const renamePerson = (id, newName) => {
+    if (!newName.trim()) return;
+    setPersonnel(prev => ({ ...prev, [squad]: prev[squad].map(p => p.id===id ? {...p, name:newName.trim()} : p) }));
+  };
+
+  const reorderPersonnel = (fromId, toId) => {
+    if (fromId === toId) return;
+    setPersonnel(prev => {
+      const list = [...prev[squad]];
+      const fromIdx = list.findIndex(p => p.id===fromId);
+      const toIdx   = list.findIndex(p => p.id===toId);
+      const [item]  = list.splice(fromIdx, 1);
+      list.splice(toIdx, 0, item);
+      return { ...prev, [squad]: list };
+    });
+  };
+
+  // attendance[id]: undefined/true=حاضر | false=غائب | {vacation,startShift,days}=عطلة
+  const setStatus = (id, status) =>
+    setAttendance(prev => ({ ...prev, [id]: status }));
+
+  const getStatus = (id) => {
+    const s = attendance[id];
+    if (s === false) return "absent";
+    if (s && s.vacation) {
+      const now = new Date(date); now.setHours(0,0,0,0);
+      const cur = Math.floor(now.getTime() / (86400000 * 3));
+      if (cur < s.startShift + Math.ceil(s.days / 3)) return "vacation";
+    }
+    return "present";
+  };
+
+  const isPresent = (id) => getStatus(id) === "present";
+
+  const toggleVehicle = (id) =>
+    setVehicleStatus(prev => ({ ...prev, [id]: prev[id] === false ? true : false }));
+
+  const isVehicleOn = (id) => vehicleStatus[id] !== false;
+
+  const addVehicle = () => {
+    if (!vName.trim()) return;
+    const t = VEHICLE_TYPES.find(x => x.key===vType) || VEHICLE_TYPES[0];
+    setVehicles(prev => [...prev, { id:Date.now(), name:vName.trim(), type:vType, icon:t.icon, color:t.color }]);
+    setVName("");
+  };
+  const delVehicle = id => setVehicles(prev => prev.filter(v => v.id !== id));
+
+  const assignGuard = (pid, personId) => {
+    setGuards(prev => prev.map(g => g.id===pid ? { ...g, guardId: personId ? parseInt(personId) : null } : g));
+    setGPicker(null);
+  };
+
+  return (
+    <div style={{
+      minHeight:"100vh",
+      background:"#252d3f",
+      fontFamily:"'Cairo','Segoe UI',sans-serif", direction:"rtl",
+      maxWidth:480, margin:"0 auto", paddingBottom:60,
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700;800;900&display=swap');
+        *{box-sizing:border-box;margin:0;padding:0}
+        html,body{background:#0d111b}
+        ::-webkit-scrollbar{width:2px}
+        ::-webkit-scrollbar-thumb{background:#2a3347;border-radius:2px}
+        input,select,button,textarea{font-family:'Cairo',sans-serif!important}
+        .tap{transition:transform .12s,opacity .12s}
+        .tap:active{opacity:.7;transform:scale(.96)}
+        .card{
+          background:rgba(255,255,255,0.035);
+          border:1px solid rgba(255,255,255,0.07);
+          border-radius:14px;
+          backdrop-filter:blur(10px);
+          -webkit-backdrop-filter:blur(10px);
+        }
+        .card-dark{
+          background:rgba(8,11,18,0.7);
+          border:1px solid rgba(255,255,255,0.06);
+          border-radius:12px;
+        }
+        .wm-wrap{
+          position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden;
+        }
+        .wm-text{
+          position:absolute;
+          color:rgba(255,255,255,0.025);
+          font-family:'Cairo',sans-serif;
+          font-size:18px;font-weight:900;
+          letter-spacing:6px;white-space:nowrap;
+          transform:rotate(-35deg);
+          user-select:none;
+        }
+        @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+        .fade-in{animation:fadeIn .3s ease forwards}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+      `}</style>
+
+      {/* Watermark */}
+      <div className="wm-wrap">
+        {Array.from({length:30}).map((_,i) => (
+          <div key={i} className="wm-text" style={{
+            left:`${(i%3)*38 - 5}%`,
+            top:`${Math.floor(i/3)*18 - 4}%`,
+          }}>KOUDJA</div>
+        ))}
+      </div>
+
+      {/* ── HEADER ── */}
+      <div style={{ position:"relative", zIndex:1 }}>
+      <div style={{
+        position:"sticky", top:0, zIndex:100,
+        background:"#1e2535ff", backdropFilter:"blur(16px)",
+        borderBottom:"1px solid #e2e6ed",
+        padding:"12px 14px 0",
+      }}>
+        {/* Title */}
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"center", marginBottom:10, position:"relative" }}>
+          <div style={{ textAlign:"center" }}>
+            <div style={{ fontSize:9, color:"#4b5563", letterSpacing:4, marginBottom:3, fontWeight:600 }}>
+              الحماية المدنية — نظام إدارة العمليات
+            </div>
+            <div style={{ fontSize:16, fontWeight:700, color:"#c5cdd8" }}>
+              توزيع المهام للفصيلة
+            </div>
+          </div>
+          {/* Share button */}
+          <button
+            className="tap"
+            onClick={() => {
+              // Build share text
+              const cycle = Math.floor(vd.getTime() / (86400000 * 3));
+              const lines = [];
+              lines.push(`🔥 توزيع المهام — ${SQUAD_NAMES[squad]}`);
+              lines.push(`📅 ${formatDate(date)}`);
+              lines.push('');
+
+              // Guard office
+              const lts = sqPersonnel.filter(p => p.rank==="ضابط" && isPresent(p.id));
+              const asts = sqPersonnel.filter(p => p.rank==="مساعد" && isPresent(p.id));
+              const officerShare = lts.length ? lts[cycle%lts.length] : (asts.length ? asts[cycle%asts.length] : null);
+              const sgPool = sqPersonnel.filter(p => (p.rank==="رقيب"||p.rank==="مساعد") && isPresent(p.id));
+              const sergeantShare = sgPool.length ? sgPool[(cycle+1)%sgPool.length] : null;
+              lines.push(`🛡️ مكتب الحراسة`);
+              lines.push(`  👮 ضابط: ${officerShare?.name||'—'}`);
+              lines.push(`  🎖️ رقيب: ${sergeantShare?.name||'—'}`);
+              lines.push('');
+
+              // Vehicles
+              lines.push(`🚗 توزيع المركبات`);
+              vehicles.filter(v => isVehicleOn(v.id)).forEach(v => {
+                const d = distribution?.[v.id] || {};
+                lines.push(`  ${v.icon} ${v.name}:`);
+                if (d.driver) lines.push(`    سائق: ${d.driver.name}`);
+                if (d.chief)  lines.push(`    رئيس: ${d.chief.name}`);
+                (d.crew||[]).forEach((p,i) => lines.push(`    عون${i+1}: ${p.name}`));
+              });
+              lines.push('');
+
+              // Guard schedule
+              lines.push(`⏰ جدول الحراسة`);
+              guards.forEach(g => {
+                const gp = g.guardId ? getPersonByIdPresent(g.guardId) : null;
+                lines.push(`  ${g.time}: ${gp ? gp.name : '—'}`);
+              });
+
+              const text = lines.join('\n');
+              const waUrl = `https://wa.me/?text=${encodeURIComponent(text)}`;
+              window.open(waUrl, '_blank');
+            }}
+            style={{
+              position:"absolute", left:0,
+              background:"#25D36622", border:"1px solid #25D36655",
+              color:"#25D366", borderRadius:8, padding:"4px 8px",
+              cursor:"pointer", fontSize:11, fontWeight:700,
+              display:"flex", alignItems:"center", gap:4,
+            }}
+          >
+            <span style={{ fontSize:14 }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="#25D366">
+                <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/>
+              </svg>
+            </span>
+            <span style={{ fontSize:9 }}>واتساب</span>
+          </button>
+        </div>
+
+        {/* Date Navigator */}
+        <div style={{
+          background:"#252d3f", borderRadius:10, padding:"8px 12px",
+          border:"1px solid #1e2330", marginBottom:8,
+          display:"flex", alignItems:"center", gap:8,
+        }}>
+          <button className="tap" onClick={goNext} style={{
+            background:"transparent", border:"none", color:"#5a6678",
+            width:28, height:28, borderRadius:6, fontSize:16, cursor:"pointer", flexShrink:0,
+          }}>‹</button>
+
+          <div style={{ flex:1, textAlign:"center" }}>
+            <div style={{ fontSize:14, fontWeight:600, color:"#c5cdd8", marginBottom:1 }}>
+              {isToday && <span style={{ color:sc.light }}>● </span>}
+              {formatDate(date)}
+            </div>
+            <div style={{ color:sc.light, fontSize:11, fontWeight:500 }}>
+              {SQUAD_NAMES[squad]}
+            </div>
+          </div>
+
+          <button className="tap" onClick={goPrev} style={{
+            background:"transparent", border:"none", color:"#5a6678",
+            width:28, height:28, borderRadius:6, fontSize:16, cursor:"pointer", flexShrink:0,
+          }}>›</button>
+        </div>
+
+        {/* Action Buttons */}
+        <div style={{ display:"flex", gap:6, paddingBottom:10 }}>
+          {[
+            { k:"settings",  i:"⚙️", l:"الإعدادات" },
+            { k:"personnel", i:"👥", l:"الأفراد"   },
+            { k:"vehicles",  i:"🚒", l:"الآليات"   },
+            { k:"stats",     i:"📊", l:"الإحصاء"   },
+          ].map(b => (
+            <button key={b.k} className="tap" onClick={() => setModal(b.k)} style={{
+              flex:1, padding:"6px 4px", borderRadius:10,
+              background: modal===b.k ? sc.bg : "#161b27",
+              border:`1px solid ${modal===b.k ? "transparent" : "#2a3347"}`,
+              color: modal===b.k ? "#fff" : "#6b7280",
+              cursor:"pointer", fontSize:9, fontWeight:600,
+              display:"flex", alignItems:"center", justifyContent:"center", gap:5,
+              transition:"all .15s",
+            }}>
+              <span style={{ fontSize:13 }}>{b.i}</span>{b.l}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* ── BODY ── */}
+      <div style={{ padding:"14px 14px" }}>
+
+        {/* Vacation Return Alerts */}
+        {(() => {
+          const alerts = getVacationAlerts();
+          if (!alerts.length) return null;
+          return (
+            <div style={{ marginBottom:12 }}>
+              {alerts.map((a,i) => (
+                <div key={i} style={{
+                  background:"#F39C1218", border:"1px solid #F39C1244",
+                  borderRadius:10, padding:"7px 12px", marginBottom:6,
+                  display:"flex", alignItems:"center", gap:8,
+                }}>
+                  <span style={{ fontSize:14 }}>🏖️</span>
+                  <span style={{ color:"#F39C12", fontSize:11, fontWeight:700, flex:1 }}>
+                    {a.type==='today'
+                      ? `${a.name} — ينتهي اليوم عطلته`
+                      : `${a.name} — يعود في الوردية القادمة`}
+                  </span>
+                  <span style={{ fontSize:10 }}>{a.type==='today' ? '✅' : '⏰'}</span>
+                </div>
+              ))}
+            </div>
+          );
+        })()}
+
+        {/* Guard Office Card */}
+        {(() => {
+          const cycle = Math.floor(vd.getTime() / (86400000 * 3));
+          const sqPresent = sqPersonnel.filter(p => isPresent(p.id));
+          const rotUI = (arr, n) => { if (!arr.length) return []; const s = ((n % arr.length) + arr.length) % arr.length; return [...arr.slice(s), ...arr.slice(0, s)]; };
+
+          // ضابط الحراسة
+          const lieutenants  = sqPresent.filter(p => p.rank === "ضابط");
+          const assistantOff = sqPresent.filter(p => p.rank === "مساعد");
+          const officer = lieutenants.length
+            ? lieutenants[cycle % lieutenants.length]
+            : (assistantOff.length ? assistantOff[cycle % assistantOff.length] : null);
+          const officerRank = officer ? officer.rank : null;
+
+          // الرقيب اليومي: من الـ state المحسوب في buildDistribution مباشرة
+          const sergeant = dailySgtId
+            ? sqPresent.find(p => p.id === dailySgtId) || null
+            : null;
+
+          const RoleCard = ({ icon, label, person, rank }) => (
+            <div style={{
+              background:"rgba(255,255,255,0.04)", borderRadius:8, padding:"7px 11px",
+              display:"flex", alignItems:"center", gap:8, border:"1px solid rgba(255,255,255,0.07)",
+            }}>
+              <span style={{ fontSize:14, flexShrink:0 }}>{icon}</span>
+              <div style={{ color:"#5a6678", fontSize:9, flexShrink:0 }}>{label}</div>
+              <div style={{ color: person ? "#ffffff" : "#4b5563", fontSize:12, fontWeight:700, flex:1 }}>
+                {person ? person.name : "—"}
+              </div>
+              {person && (
+                <span style={{
+                  background:`${RANK_COLORS[person.rank]||"#6b7280"}22`,
+                  color: RANK_COLORS[person.rank]||"#6b7280",
+                  border:`1px solid ${RANK_COLORS[person.rank]||"#6b7280"}55`,
+                  borderRadius:5, padding:"1px 6px", fontSize:9, fontWeight:700, flexShrink:0,
+                }}>{person.rank}</span>
+              )}
+            </div>
+          );
+
+          return (
+            <div style={{
+              background:"rgba(15,18,30,0.85)", backdropFilter:"blur(12px)", borderRadius:14, padding:"10px 14px",
+              border:`1px solid ${sc.bg}44`, borderRight:`3px solid ${sc.bg}`,
+              marginBottom:14, boxShadow:"none",
+            }}>
+              <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:7 }}>
+                <span style={{ fontSize:14 }}>🛡️</span>
+                <span style={{ color:"#e8ecf1", fontSize:12, fontWeight:800 }}>مكتب الحراسة</span>
+              </div>
+              <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
+                <RoleCard icon="👮" label="ضابط" person={officer} rank={officerRank||"ضابط"}/>
+                <RoleCard icon="🎖️" label="رقيب" person={sergeant} rank={sergeant?.rank||"رقيب"}/>
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* Vehicles — Smart Distribution */}
+        <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:10 }}>
+          <div style={{ width:4, height:20, background:sc.bg, borderRadius:2 }}/>
+          <span style={{ color:"#f1f5f9", fontSize:14, fontWeight:800, letterSpacing:-0.2 }}>توزيع المهام</span>
+        </div>
+
+        <div style={{ marginBottom:28 }}>
+          {VEHICLE_TYPES.map(vt => {
+            const group = vehicles.filter(v => v.type === vt.key);
+            if (group.length === 0) return null;
+            return (
+              <div key={vt.key} style={{ marginBottom:18 }}>
+                {/* Category label */}
+                <div style={{ display:"flex", alignItems:"center", gap:7, marginBottom:8 }}>
+                  <span style={{ fontSize:14 }}>{vt.icon}</span>
+                  <span style={{ color:vt.color, fontSize:11, fontWeight:800, background:`${vt.color}18`, border:`1px solid ${vt.color}40`, borderRadius:6, padding:"2px 9px" }}>{vt.label}</span>
+                  <div style={{ flex:1, height:1, background:"#222840" }}/>
+                </div>
+
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+                  {group.map(v => {
+                    const d = distribution?.[v.id] || {};
+                    const cfg = vehicleCounts[v.id] || {};
+
+                    const MemberRow = ({ person, role, roleColor }) => (
+                      <div style={{ display:"flex", alignItems:"center", gap:5, padding:"5px 8px", background:"rgba(15,18,30,0.6)", borderRadius:8, border:"1px solid rgba(255,255,255,0.06)" }}>
+                        <div style={{ width:5, height:5, borderRadius:"50%", background: roleColor || "#6b7280", flexShrink:0 }}/>
+                        <div style={{ flex:1, minWidth:0 }}>
+                          <div style={{ color: person?"#ffffff":"#4b5563", fontSize:10, fontWeight:700, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                            {person ? person.name : "—"}
+                          </div>
+                          {person && <div style={{ color: RANK_COLORS[person.rank]||"#6b7280", fontSize:8, fontWeight:700 }}>{person.rank}</div>}
+                        </div>
+                        <div style={{ color:"#6b7280", fontSize:8, fontWeight:600, background:"#0f1420", borderRadius:4, padding:"1px 5px", flexShrink:0 }}>{role}</div>
+                      </div>
+                    );
+
+                    return (
+                      <div key={v.id} style={{
+                        background:"#161b27", borderRadius:14,
+                        border:`1px solid ${isVehicleOn(v.id) ? "#2a3347" : "#ff4b2b33"}`,
+                        borderTop:`3px solid ${isVehicleOn(v.id) ? v.color : "#374151"}`,
+                        overflow:"hidden", opacity: isVehicleOn(v.id) ? 1 : 0.45,
+                        transition:"all .2s",
+                      }}>
+                        {/* Vehicle header */}
+                        <div style={{ padding:"8px 10px 6px", display:"flex", alignItems:"center", gap:6 }}>
+                          <span style={{ fontSize:18 }}>{v.icon}</span>
+                          {editVehicleId === v.id ? (
+                            <input
+                              autoFocus
+                              value={editVehicleName}
+                              onChange={e => setEditVehicleName(e.target.value)}
+                              onBlur={() => {
+                                if (editVehicleName.trim()) setVehicles(prev => prev.map(x => x.id===v.id ? {...x,name:editVehicleName.trim()} : x));
+                                setEditVehicleId(null);
+                              }}
+                              onKeyDown={e => {
+                                if(e.key==="Enter"){ if(editVehicleName.trim()) setVehicles(prev=>prev.map(x=>x.id===v.id?{...x,name:editVehicleName.trim()}:x)); setEditVehicleId(null); }
+                                if(e.key==="Escape") setEditVehicleId(null);
+                              }}
+                              style={{ flex:1, background:"transparent", border:"none", borderBottom:`1px solid ${sc.bg}`, color:"#e8ecf1", fontSize:11, fontWeight:800, outline:"none", fontFamily:"'Cairo',sans-serif" }}
+                            />
+                          ) : (
+                            <span
+                              onClick={() => { setEditVehicleId(v.id); setEditVehicleName(v.name); }}
+                              style={{ color: isVehicleOn(v.id) ? "#f8fafc" : "#4b5563", fontSize:12, fontWeight:800, flex:1, cursor:"text", letterSpacing:-0.2 }}
+                            >{v.name}</span>
+                          )}
+                          {/* Driver warning */}
+                          {isVehicleOn(v.id) && !d.driver && (
+                            <span style={{ fontSize:10, color:"#FF4B2B" }} title="لا يوجد سائق">⚠️</span>
+                          )}
+                          <button
+                            onClick={() => toggleVehicle(v.id)}
+                            style={{
+                              background: isVehicleOn(v.id) ? "#00B86B22" : "#ff4b2b22",
+                              border:`1px solid ${isVehicleOn(v.id) ? "#00B86B55" : "#ff4b2b55"}`,
+                              color: isVehicleOn(v.id) ? "#00D97E" : "#ff6b4a",
+                              borderRadius:6, padding:"2px 7px",
+                              cursor:"pointer", fontSize:9, fontWeight:800, flexShrink:0,
+                            }}
+                          >
+                            {isVehicleOn(v.id) ? "ON" : "OFF"}
+                          </button>
+                        </div>
+
+                        <div style={{ padding:"0 8px 8px", display:"flex", flexDirection:"column", gap:4 }}>
+                          {isVehicleOn(v.id) ? (<>
+                          <MemberRow person={d.driver} role="سائق" roleColor="#F59E0B"/>
+                          {v.type !== "VL" && (
+                            <MemberRow
+                              person={d.chief}
+                              role={
+                                v.type==="إسعاف" ? "رئيس" :
+                                d.chief && d.chief.rank==="ضابط" ? "رئيس+قائد" :
+                                d.chief && d.chief.rank==="مساعد" ? "رئيس+رقيب" :
+                                "رئيس"
+                              }
+                              roleColor={
+                                d.chief && (d.chief.rank==="ضابط"||d.chief.rank==="مساعد") ? "#F59E0B" : "#8B5CF6"
+                              }
+                            />
+                          )}
+                          {(() => {
+                            if (v.type !== "تدخل") {
+                              return (d.crew||[]).map((p,i) => (
+                                <MemberRow key={i} person={p} role="عون" roleColor="#6b7280"/>
+                              ));
+                            }
+                            const nCorp = (vehicleCounts[v.id]||{}).corporals ?? 1;
+                            const nAg   = (vehicleCounts[v.id]||{}).agents    ?? 1;
+                            const crew  = d.crew || [];
+                            const rows  = [];
+                            // Corporal slots
+                            for (let i=0; i<nCorp; i++) {
+                              rows.push(<MemberRow key={`c${i}`} person={crew[i]||null} role="عريف" roleColor="#8B5CF6"/>);
+                            }
+                            // Agent slots — show empty if missing
+                            for (let i=0; i<nAg; i++) {
+                              const p = crew[nCorp+i] || null;
+                              rows.push(
+                                <MemberRow key={`a${i}`} person={p} role="عون" roleColor="#6b7280"/>
+                              );
+                            }
+                            return rows;
+                          })()}
+
+                          {/* Counter for ambulance agents */}
+                          {v.type === "إسعاف" && (
+                            <div style={{
+                              display:"flex", alignItems:"center", gap:6,
+                              marginTop:4, padding:"5px 6px",
+                              background:"#161b27", borderRadius:7,
+                              border:"1px dashed #2a3347",
+                            }}>
+                              <span style={{ color:"#5a6678", fontSize:9, flex:1 }}>أعوان</span>
+                              <button
+                                onClick={() => setVehicleCounts(p => ({...p,[v.id]:{...cfg,agents:Math.max(0,(cfg.agents??1)-1)}}))}
+                                style={{ background:"#222840",border:"none",color:"#7a8799",width:20,height:20,borderRadius:5,cursor:"pointer",fontSize:13,lineHeight:1,flexShrink:0 }}
+                              >−</button>
+                              <span style={{ color:"#e8ecf1",fontWeight:800,fontSize:12,minWidth:14,textAlign:"center" }}>
+                                {cfg.agents ?? 1}
+                              </span>
+                              <button
+                                onClick={() => setVehicleCounts(p => ({...p,[v.id]:{...cfg,agents:Math.min(3,(cfg.agents??1)+1)}}))}
+                                style={{ background:"#222840",border:"none",color:"#7a8799",width:20,height:20,borderRadius:5,cursor:"pointer",fontSize:13,lineHeight:1,flexShrink:0 }}
+                              >+</button>
+                            </div>
+                          )}
+
+                          {/* Counters for truck corporals and agents */}
+                          {v.type === "تدخل" && (
+                            <div style={{ display:"flex", flexDirection:"column", gap:4, marginTop:4 }}>
+                              <div style={{
+                                display:"flex", alignItems:"center", gap:6,
+                                padding:"5px 6px", background:"#252d3f", borderRadius:7,
+                                border:"1px dashed #2d3550",
+                              }}>
+                                <span style={{ color: RANK_COLORS["عريف"], fontSize:9, flex:1 }}>عرفاء</span>
+                                <button
+                                  onClick={() => setVehicleCounts(p => ({...p,[v.id]:{...cfg,corporals:Math.max(0,(cfg.corporals??1)-1)}}))}
+                                  style={{ background:"#222840",border:"none",color:"#7a8799",width:20,height:20,borderRadius:5,cursor:"pointer",fontSize:13,lineHeight:1,flexShrink:0 }}
+                                >−</button>
+                                <span style={{ color:"#e8ecf1",fontWeight:800,fontSize:12,minWidth:14,textAlign:"center" }}>
+                                  {cfg.corporals ?? 1}
+                                </span>
+                                <button
+                                  onClick={() => setVehicleCounts(p => ({...p,[v.id]:{...cfg,corporals:Math.min(4,(cfg.corporals??1)+1)}}))}
+                                  style={{ background:"#222840",border:"none",color:"#7a8799",width:20,height:20,borderRadius:5,cursor:"pointer",fontSize:13,lineHeight:1,flexShrink:0 }}
+                                >+</button>
+                              </div>
+                              <div style={{
+                                display:"flex", alignItems:"center", gap:6,
+                                padding:"5px 6px", background:"#252d3f", borderRadius:7,
+                                border:"1px dashed #2d3550",
+                              }}>
+                                <span style={{ color: RANK_COLORS["عون"], fontSize:9, flex:1 }}>أعوان</span>
+                                <button
+                                  onClick={() => setVehicleCounts(p => ({...p,[v.id]:{...cfg,agents:Math.max(0,(cfg.agents??1)-1)}}))}
+                                  style={{ background:"#222840",border:"none",color:"#7a8799",width:20,height:20,borderRadius:5,cursor:"pointer",fontSize:13,lineHeight:1,flexShrink:0 }}
+                                >−</button>
+                                <span style={{ color:"#e8ecf1",fontWeight:800,fontSize:12,minWidth:14,textAlign:"center" }}>
+                                  {cfg.agents ?? 1}
+                                </span>
+                                <button
+                                  onClick={() => setVehicleCounts(p => ({...p,[v.id]:{...cfg,agents:Math.min(4,(cfg.agents??1)+1)}}))}
+                                  style={{ background:"#222840",border:"none",color:"#7a8799",width:20,height:20,borderRadius:5,cursor:"pointer",fontSize:13,lineHeight:1,flexShrink:0 }}
+                                >+</button>
+                              </div>
+                            </div>
+                          )}
+                          </>) : (
+                            <div style={{ padding:"6px 4px", textAlign:"center", color:"#ff6b4a", fontSize:10, fontWeight:700 }}>
+                              خارج الخدمة
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Guard Schedule */}
+        <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:12 }}>
+          <div style={{ width:4, height:20, background:sc.bg, borderRadius:2 }}/>
+          <span style={{ color:"#f1f5f9", fontSize:14, fontWeight:800, letterSpacing:-0.2 }}>جدول فترات الحراسة</span>
+        </div>
+
+        <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+          {(() => {
+            const prevGuardIds = getPrevGuardIds();
+            return guards.map((g, i) => {
+            const gPerson  = g.guardId  ? getPersonByIdPresent(g.guardId)  : null;
+            const gPerson2 = g.guardId2 ? getPersonByIdPresent(g.guardId2) : null;
+            const gName    = gPerson  ? gPerson.name  : null;
+            const gName2   = gPerson2 ? gPerson2.name : null;
+            const nameColor  = gPerson  ? (RANK_COLORS[gPerson.rank]  || sc.light) : "#5a6678";
+            const nameColor2 = gPerson2 ? (RANK_COLORS[gPerson2.rank] || sc.light) : "#5a6678";
+            const repeated   = gPerson && prevGuardIds.has(gPerson.id);
+            const count      = g.count ?? 1;
+
+            const toggleCount = () => {
+              const newCount = count === 1 ? 2 : 1;
+              setGuards(prev => prev.map(x => x.id===g.id
+                ? { ...x, count: newCount, guardId2: newCount===1 ? null : x.guardId2 }
+                : x
+              ));
+            };
+
+            const NameBadge = ({ person, name, color, rep }) => (
+              <div style={{
+                background: name ? `${color}20` : "#161b27",
+                border:`1px solid ${name ? color+"55" : "#2a3347"}`,
+                borderRadius:7, padding:"5px 8px", flex:1, textAlign:"center",
+              }}>
+                {name ? (
+                  <div>
+                    <div style={{ color:"#ffffff", fontSize:12, fontWeight:800 }}>{name}</div>
+                    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:3 }}>
+                      {person && <span style={{ color, fontSize:9, fontWeight:700 }}>{person.rank}</span>}
+                      {rep && <span style={{ color:"#F59E0B", fontSize:8 }}>↺</span>}
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ color:"#5a6678", fontSize:10 }}>—</div>
+                )}
+              </div>
+            );
+
+            return (
+              <div key={g.id} style={{
+                background:"rgba(10,14,22,0.75)", borderRadius:12, border:"1px solid rgba(255,255,255,0.06)",
+                borderRight:`4px solid ${i%2===0 ? sc.bg : sc.bg+"77"}`,
+                padding:"10px 12px",
+              }}>
+                <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                  {/* Period number */}
+                  <div style={{
+                    width:26, height:26, borderRadius:"50%", flexShrink:0,
+                    background:`${sc.bg}16`, border:`1px solid ${sc.bg}38`,
+                    display:"flex", alignItems:"center", justifyContent:"center",
+                    fontSize:10, fontWeight:800, color:sc.light,
+                  }}>{i+1}</div>
+
+                  {/* Time */}
+                  <div style={{ minWidth:90 }}>
+                    <div style={{ color:"#5a6678", fontSize:9, marginBottom:1 }}>{g.period}</div>
+                    <div style={{ color:"#e8ecf1", fontSize:12, fontWeight:700 }}>{g.time}</div>
+                  </div>
+
+                  {/* Count toggle */}
+                  <button onClick={toggleCount} style={{
+                    background: count===2 ? `${sc.bg}22` : "#252d3f",
+                    border:`1px solid ${count===2 ? sc.bg+"55" : "#2a3347"}`,
+                    color: count===2 ? sc.light : "#5a6678",
+                    borderRadius:6, padding:"3px 7px", cursor:"pointer",
+                    fontSize:10, fontWeight:700, flexShrink:0,
+                  }}>
+                    {count===1 ? "حارس" : "حارسين"}
+                  </button>
+
+                  {/* Guard name(s) */}
+                  <div style={{ display:"flex", gap:5, flex:1 }}>
+                    <NameBadge person={gPerson} name={gName} color={nameColor} rep={repeated}/>
+                    {count === 2 && (
+                      <NameBadge person={gPerson2} name={gName2} color={nameColor2} rep={false}/>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          });})()}
+        </div>
+
+        {/* Shift Note */}
+        <div style={{ marginTop:16, marginBottom:16 }}>
+          <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:7 }}>
+            <div style={{ width:4, height:16, background:"#F59E0B", borderRadius:2 }}/>
+            <span style={{ color:"#e8ecf1", fontSize:13, fontWeight:700 }}>ملاحظات الوردية</span>
+          </div>
+          <textarea
+            value={shiftNote}
+            onChange={e => setShiftNote(e.target.value)}
+            placeholder="أضف ملاحظات للوردية..."
+            rows={2}
+            style={{
+              width:"100%", background:"#161b27cc", border:`1px solid #2d3550`,
+              color:"#e8ecf1", borderRadius:10, padding:"8px 12px", fontSize:12,
+              direction:"rtl", outline:"none", fontFamily:"'Cairo',sans-serif",
+              resize:"none", boxSizing:"border-box",
+            }}
+          />
+        </div>
+
+        {/* Unassigned Personnel */}
+        {(() => {
+          const assignedIds = new Set();
+          // أفراد المركبات
+          if (distribution) {
+            Object.values(distribution).forEach(d => {
+              if (d.driver) assignedIds.add(d.driver.id);
+              if (d.chief)  assignedIds.add(d.chief.id);
+              (d.crew||[]).forEach(p => assignedIds.add(p.id));
+            });
+          }
+          // أفراد مكتب الحراسة (ضابط الحراسة + الرقيب اليومي)
+          const sqPresent = sqPersonnel.filter(p => isPresent(p.id));
+          const cycleUA   = Math.floor(vd.getTime() / (86400000 * 3));
+          const lts = sqPresent.filter(p => p.rank === "ضابط");
+          const asts = sqPresent.filter(p => p.rank === "مساعد");
+          const guardOfficer = lts.length
+            ? lts[cycleUA % lts.length]
+            : (asts.length ? asts[cycleUA % asts.length] : null);
+          if (guardOfficer) assignedIds.add(guardOfficer.id);
+          if (dailySgtId)   assignedIds.add(dailySgtId);
+          const unassigned = sqPersonnel.filter(p => isPresent(p.id) && !assignedIds.has(p.id));
+          if (unassigned.length === 0) return null;
+          return (
+            <div style={{ marginTop:20 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:10 }}>
+                <div style={{ width:4, height:20, background:"#6b7280", borderRadius:2 }}/>
+                <span style={{ color:"#7a8799", fontSize:14, fontWeight:700 }}>غير معيَّنين</span>
+                <span style={{ background:"#252d3f", color:"#5a6678", fontSize:10, padding:"2px 10px", borderRadius:20 }}>
+                  {unassigned.length} فرد
+                </span>
+              </div>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:7 }}>
+                {unassigned.map(p => (
+                  <div key={p.id} style={{
+                    background:"#252d3f", borderRadius:10,
+                    border:`1px solid ${RANK_COLORS[p.rank]||"#2a3347"}33`,
+                    padding:"7px 11px",
+                    display:"flex", alignItems:"center", gap:7,
+                  }}>
+                    <div style={{
+                      width:7, height:7, borderRadius:"50%", flexShrink:0,
+                      background: RANK_COLORS[p.rank]||"#6b7280",
+                    }}/>
+                    <div>
+                      <div style={{ color:"#ffffff", fontSize:11, fontWeight:700 }}>{p.name}</div>
+                      <div style={{ color: RANK_COLORS[p.rank]||"#6b7280", fontSize:9, fontWeight:700 }}>{p.rank}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })()}
+      </div>
+
+      {/* ── GUARD PICKER ── */}
+      {gPicker !== null && (
+        <Sheet title={`تعيين حارس — ${guards.find(g => g.id===gPicker)?.period}`} onClose={() => setGPicker(null)}>
+          <button onClick={() => assignGuard(gPicker, null)} style={{
+            width:"100%", padding:10, background:"#222840",
+            border:"1px solid #2d3550", color:"#ef4444", borderRadius:10,
+            cursor:"pointer", marginBottom:12, fontSize:13, fontWeight:700,
+          }}>✕ إزالة التعيين</button>
+          <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+            {sqPersonnel.map(p => {
+              const sel = guards.find(g => g.id===gPicker)?.guardId === p.id;
+              return (
+                <button key={p.id} onClick={() => assignGuard(gPicker, p.id)} style={{
+                  background: sel ? `linear-gradient(135deg,${sc.bg},${sc.light})` : "#252d3f",
+                  border: sel ? "none" : "1px solid #1a2035",
+                  borderRadius:10, padding:"10px 13px",
+                  display:"flex", alignItems:"center", gap:10,
+                  cursor:"pointer", color:"#e8ecf1", textAlign:"right", width:"100%",
+                }}>
+                  <div>
+                    <div style={{ fontSize:13, fontWeight:700 }}>{p.name}</div>
+                    <div style={{ fontSize:10, color: sel ? "#ffffff99" : (RANK_COLORS[p.rank]||"#9ca3af") }}>{p.rank}</div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </Sheet>
+      )}
+
+      {/* ── PERSONNEL ── */}
+      {modal === "personnel" && (
+        <Sheet title={`أفراد ${SQUAD_NAMES[squad]}`} onClose={() => { setModal(null); setShowAddPerson(false); setEditingPerson(null); setConfirmDelete(null); }}>
+          <div style={{ maxHeight:420, overflowY:"auto", marginBottom:14 }}>
+            {(() => {
+              // Group by rank
+              const grouped = {};
+              RANKS.forEach(r => { grouped[r] = []; });
+              sqPersonnel.forEach(p => {
+                if (grouped[p.rank]) grouped[p.rank].push(p);
+                else grouped["عون"] = [...(grouped["عون"]||[]), p];
+              });
+              return RANKS.map((rank, ri) => {
+                const members = grouped[rank] || [];
+                if (members.length === 0) return null;
+                return (
+                  <div key={rank}>
+                    {/* Rank separator */}
+                    <div style={{
+                      display:"flex", alignItems:"center", gap:8,
+                      padding:"10px 0 6px",
+                    }}>
+                      <span style={{
+                        background:`${RANK_COLORS[rank]}22`,
+                        color: RANK_COLORS[rank],
+                        border:`1px solid ${RANK_COLORS[rank]}55`,
+                        borderRadius:6, padding:"2px 10px", fontSize:11, fontWeight:800,
+                      }}>{rank}</span>
+                      <div style={{ flex:1, height:1, background:"#222840" }}/>
+                      <span style={{ color:"#5a6678", fontSize:10 }}>
+                        {members.filter(p => isPresent(p.id)).length}/{members.length}
+                      </span>
+                    </div>
+                    {/* Members */}
+                    <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
+                      {members.map(p => (
+                        <div
+                          key={p.id}
+                          draggable
+                          onDragStart={() => setDragId(p.id)}
+                          onDragOver={e => { e.preventDefault(); setDragOverId(p.id); }}
+                          onDrop={() => { reorderPersonnel(dragId, p.id); setDragId(null); setDragOverId(null); }}
+                          onDragEnd={() => { setDragId(null); setDragOverId(null); }}
+                          style={{
+                            background: dragOverId===p.id ? `${sc.bg}18` : "#1e2535",
+                            borderRadius:10, padding:"8px 10px",
+                            display:"flex", alignItems:"center", gap:8,
+                            border:`1px solid ${dragOverId===p.id ? sc.bg+"55" : isPresent(p.id) ? "#2a3347" : "#ff4b2b33"}`,
+                            cursor:"grab", transition:"background .15s",
+                            opacity: dragId===p.id ? 0.4 : isPresent(p.id) ? 1 : 0.5,
+                          }}
+                        >
+                          {/* Drag handle */}
+                          <span style={{ color:"#2a3347", fontSize:14, cursor:"grab", flexShrink:0 }}>⠿</span>
+
+                          {/* Name / edit */}
+                          <div style={{ flex:1 }}>
+                            {editingPerson?.id === p.id ? (
+                              <input
+                                autoFocus
+                                value={editingPerson.name}
+                                onChange={e => setEditingPerson({...editingPerson, name:e.target.value})}
+                                onBlur={() => { renamePerson(p.id, editingPerson.name); setEditingPerson(null); }}
+                                onKeyDown={e => { if(e.key==="Enter"){ renamePerson(p.id, editingPerson.name); setEditingPerson(null); } if(e.key==="Escape") setEditingPerson(null); }}
+                                style={{ ...inputSt, padding:"4px 8px", fontSize:12, borderRadius:6 }}
+                              />
+                            ) : (
+                              <div style={{ color: isPresent(p.id) ? "#ffffff" : "#6b7280", fontSize:12, fontWeight:700 }}>
+                                {p.name}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Attendance button */}
+                          {(() => {
+                            const st = getStatus(p.id);
+                            const att = attendance[p.id];
+                            const vd2 = new Date(date); vd2.setHours(0,0,0,0);
+                            const curShift = Math.floor(vd2.getTime()/(86400000*3));
+                            let remaining = "";
+                            if(st==="vacation" && att?.vacation){
+                              const shifts = Math.ceil(att.days/3);
+                              const left = (att.startShift + shifts) - curShift;
+                              remaining = ` (${left*3}ي)`;
+                            }
+                            const colors = {
+                              present: {bg:"#00B86B22",bd:"#00B86B55",cl:"#00D97E"},
+                              absent:  {bg:"#E74C3C22",bd:"#E74C3C55",cl:"#E74C3C"},
+                              vacation:{bg:"#F39C1244",bd:"#F39C12aa",cl:"#ffffff"},
+                            };
+                            const c = colors[st];
+                            const labels = {present:"✓ حاضر", absent:"✗ غائب", vacation:`🏖 عطلة${remaining}`};
+                            return (
+                              <button onClick={(e)=>{
+                                const rect=e.target.getBoundingClientRect();
+                                setAttPopup({id:p.id, top:rect.bottom+4});
+                                setVacDays(30);
+                              }} style={{
+                                background:c.bg, border:`1px solid ${c.bd}`, color:c.cl,
+                                borderRadius:6, padding:"3px 8px", cursor:"pointer",
+                                fontSize:10, fontWeight:700, flexShrink:0, whiteSpace:"nowrap",
+                              }}>{labels[st]}</button>
+                            );
+                          })()}
+
+                          {/* Edit button */}
+                          <button onClick={() => setEditingPerson({id:p.id, name:p.name})} style={{
+                            background:"#222840", border:"1px solid #2d3550", color:"#7a8799",
+                            width:26, height:26, borderRadius:6, cursor:"pointer", fontSize:12, flexShrink:0,
+                          }}>✎</button>
+
+                          {/* Delete button */}
+                          <button onClick={() => setConfirmDelete(p.id)} style={{
+                            background:"#ff4b2b15", border:"1px solid #ff4b2b38", color:"#ff4b2b",
+                            width:26, height:26, borderRadius:6, cursor:"pointer", fontSize:14, flexShrink:0,
+                          }}>−</button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              });
+            })()}
+          </div>
+
+          {/* + Button */}
+          <button className="tap" onClick={() => setShowAddPerson(true)} style={{
+            width:"100%", padding:"12px", border:`2px dashed ${sc.bg}60`,
+            background:`${sc.bg}10`, color:sc.light, borderRadius:12,
+            cursor:"pointer", fontSize:15, fontWeight:700, display:"flex",
+            alignItems:"center", justifyContent:"center", gap:8,
+          }}>
+            <span style={{ fontSize:22, lineHeight:1 }}>+</span> إضافة فرد
+          </button>
+        </Sheet>
+      )}
+
+      {/* ── CONFIRM DELETE ── */}
+      {confirmDelete !== null && (
+        <div style={{
+          position:"fixed", inset:0, background:"rgba(0,0,0,0.85)", zIndex:400,
+          display:"flex", alignItems:"center", justifyContent:"center",
+          backdropFilter:"blur(8px)", padding:"0 20px",
+        }} onClick={() => setConfirmDelete(null)}>
+          <div style={{
+            background:"#252d3f", borderRadius:20, padding:"24px 20px",
+            width:"100%", maxWidth:320, direction:"rtl",
+            boxShadow:"0 20px 60px #000c", textAlign:"center",
+          }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize:36, marginBottom:12 }}>🗑️</div>
+            <div style={{ color:"#e8ecf1", fontSize:15, fontWeight:700, marginBottom:6 }}>حذف الفرد؟</div>
+            <div style={{ color:"#5a6678", fontSize:12, marginBottom:20 }}>
+              {sqPersonnel.find(p=>p.id===confirmDelete)?.name}
+            </div>
+            <div style={{ display:"flex", gap:8 }}>
+              <button onClick={() => setConfirmDelete(null)} style={{
+                flex:1, padding:"11px", border:"1px solid #2d3550",
+                background:"#222840", color:"#7a8799", borderRadius:10,
+                cursor:"pointer", fontWeight:700, fontSize:13,
+              }}>إلغاء</button>
+              <button onClick={() => { delPerson(squad, confirmDelete); setConfirmDelete(null); }} style={{
+                flex:1, padding:"11px", border:"none",
+                background:"linear-gradient(135deg,#FF4B2B,#FF6B4A)",
+                color:"#fff", borderRadius:10, cursor:"pointer", fontWeight:700, fontSize:13,
+              }}>✓ حذف</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── ADD PERSON POPUP ── */}
+      {showAddPerson && (
+        <div style={{
+          position:"fixed", inset:0, background:"rgba(0,0,0,0.85)", zIndex:300,
+          display:"flex", alignItems:"center", justifyContent:"center",
+          backdropFilter:"blur(8px)", padding:"0 20px",
+        }} onClick={() => setShowAddPerson(false)}>
+          <div style={{
+            background:"#252d3f", borderRadius:20, padding:"24px 20px",
+            width:"100%", maxWidth:360, direction:"rtl",
+            boxShadow:"0 20px 60px #000c",
+          }} onClick={e => e.stopPropagation()}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:18 }}>
+              <h3 style={{ color:"#e8ecf1", fontSize:16, fontWeight:700, margin:0 }}>إضافة فرد جديد</h3>
+              <button onClick={() => setShowAddPerson(false)} style={{
+                background:"#222840", border:"none", color:"#7a8799",
+                width:30, height:30, borderRadius:"50%", cursor:"pointer", fontSize:16,
+              }}>×</button>
+            </div>
+            <input
+              placeholder="الاسم الكامل *"
+              value={pName}
+              onChange={e => setPName(e.target.value)}
+              style={inputSt}
+              autoFocus
+            />
+            <select value={pRank} onChange={e => setPRank(e.target.value)} style={{ ...inputSt, marginTop:10 }}>
+              {RANKS.map(r => <option key={r}>{r}</option>)}
+            </select>
+            <div style={{ display:"flex", gap:8, marginTop:14 }}>
+              <button onClick={() => setShowAddPerson(false)} style={{
+                flex:1, padding:"11px", border:"1px solid #2d3550",
+                background:"#222840", color:"#7a8799", borderRadius:10,
+                cursor:"pointer", fontWeight:700, fontSize:13,
+              }}>إلغاء</button>
+              <button onClick={() => { addPerson(); setShowAddPerson(false); }} style={{
+                flex:2, padding:"11px", border:"none",
+                background:`linear-gradient(135deg,${sc.bg},${sc.light})`,
+                color:"#fff", borderRadius:10, cursor:"pointer", fontWeight:700, fontSize:13,
+              }}>✓ إضافة</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── VEHICLES ── */}
+      {modal === "vehicles" && (
+        <Sheet title="إدارة الآليات" onClose={() => { setModal(null); setShowAddVehicle(false); }}>
+          <div style={{ maxHeight:420, overflowY:"auto", marginBottom:14 }}>
+            {VEHICLE_TYPES.map(vt => {
+              const group = vehicles.filter(v => v.type === vt.key);
+              return (
+                <div key={vt.key}>
+                  {/* Category header */}
+                  <div style={{ display:"flex", alignItems:"center", gap:8, padding:"10px 0 6px" }}>
+                    <span style={{ fontSize:18 }}>{vt.icon}</span>
+                    <span style={{
+                      color: vt.color, fontSize:12, fontWeight:800,
+                      background:`${vt.color}18`, border:`1px solid ${vt.color}44`,
+                      borderRadius:6, padding:"2px 10px",
+                    }}>{vt.label}</span>
+                    <div style={{ flex:1, height:1, background:"#222840" }}/>
+                    <span style={{ color:"#5a6678", fontSize:10 }}>{group.length}</span>
+                  </div>
+                  {/* Vehicles in group */}
+                  <div style={{ display:"flex", flexDirection:"column", gap:6, marginBottom:4 }}>
+                    {group.length === 0 ? (
+                      <div style={{ color:"#2a3347", fontSize:11, padding:"6px 10px", textAlign:"center" }}>
+                        لا توجد مركبات
+                      </div>
+                    ) : group.map(v => (
+                      <div key={v.id} style={{
+                        background:"#252d3f", borderRadius:10, padding:"10px 12px",
+                        display:"flex", alignItems:"center", gap:10,
+                        border:`1px solid ${v.color}30`, borderRight:`4px solid ${v.color}`,
+                      }}>
+                        <span style={{ fontSize:20 }}>{v.icon}</span>
+                        <div style={{ flex:1 }}>
+                          <div style={{ color:"#e8ecf1", fontSize:13, fontWeight:700 }}>{v.name}</div>
+                          <div style={{ color:"#5a6678", fontSize:10 }}>
+                            {sqPersonnel.filter(p => p.vehicleId===v.id).length} فرد مُعيَّن
+                          </div>
+                        </div>
+                        <button onClick={() => setConfirmDeleteVehicle(v.id)} style={{
+                          background:"#ff4b2b15", border:"1px solid #ff4b2b38", color:"#ff4b2b",
+                          width:27, height:27, borderRadius:7, cursor:"pointer", fontSize:15,
+                        }}>−</button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* + Add button */}
+          <button className="tap" onClick={() => setShowAddVehicle(true)} style={{
+            width:"100%", padding:"12px", border:`2px dashed ${sc.bg}60`,
+            background:`${sc.bg}10`, color:sc.light, borderRadius:12,
+            cursor:"pointer", fontSize:15, fontWeight:700, display:"flex",
+            alignItems:"center", justifyContent:"center", gap:8,
+          }}>
+            <span style={{ fontSize:22, lineHeight:1 }}>+</span> إضافة مركبة
+          </button>
+        </Sheet>
+      )}
+
+      {/* ── ADD VEHICLE POPUP ── */}
+      {showAddVehicle && (
+        <div style={{
+          position:"fixed", inset:0, background:"rgba(0,0,0,0.85)", zIndex:300,
+          display:"flex", alignItems:"center", justifyContent:"center",
+          backdropFilter:"blur(8px)", padding:"0 20px",
+        }} onClick={() => setShowAddVehicle(false)}>
+          <div style={{
+            background:"#252d3f", borderRadius:20, padding:"24px 20px",
+            width:"100%", maxWidth:360, direction:"rtl",
+            boxShadow:"0 20px 60px #000c",
+          }} onClick={e => e.stopPropagation()}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:18 }}>
+              <h3 style={{ color:"#e8ecf1", fontSize:16, fontWeight:700, margin:0 }}>إضافة مركبة</h3>
+              <button onClick={() => setShowAddVehicle(false)} style={{
+                background:"#222840", border:"none", color:"#7a8799",
+                width:30, height:30, borderRadius:"50%", cursor:"pointer", fontSize:16,
+              }}>×</button>
+            </div>
+
+            {/* Type selector */}
+            <div style={{ display:"flex", gap:7, marginBottom:12 }}>
+              {VEHICLE_TYPES.map(vt => (
+                <button key={vt.key} onClick={() => setVType(vt.key)} style={{
+                  flex:1, padding:"8px 4px", borderRadius:10, cursor:"pointer",
+                  background: vType===vt.key ? `linear-gradient(135deg,${vt.color},${vt.color}cc)` : "#2a3347",
+                  border: vType===vt.key ? "none" : `1px solid #2d3550`,
+                  color:"#fff", fontWeight:700, fontSize:10,
+                  display:"flex", flexDirection:"column", alignItems:"center", gap:3,
+                }}>
+                  <span style={{ fontSize:18 }}>{vt.icon}</span>
+                  <span style={{ fontSize:9, lineHeight:1.2, textAlign:"center" }}>{vt.label}</span>
+                </button>
+              ))}
+            </div>
+
+            <input
+              autoFocus
+              placeholder={`مثال: ${vType==="VL"?"VL 03":vType==="إسعاف"?"إسعاف 03":"شاحنة صهريج"}`}
+              value={vName}
+              onChange={e => setVName(e.target.value)}
+              onKeyDown={e => { if(e.key==="Enter"){ addVehicle(); setShowAddVehicle(false); }}}
+              style={inputSt}
+            />
+            <div style={{ display:"flex", gap:8, marginTop:14 }}>
+              <button onClick={() => setShowAddVehicle(false)} style={{
+                flex:1, padding:"11px", border:"1px solid #2d3550",
+                background:"#222840", color:"#7a8799", borderRadius:10,
+                cursor:"pointer", fontWeight:700, fontSize:13,
+              }}>إلغاء</button>
+              <button onClick={() => { addVehicle(); setShowAddVehicle(false); }} style={{
+                flex:2, padding:"11px", border:"none",
+                background:`linear-gradient(135deg,${sc.bg},${sc.light})`,
+                color:"#fff", borderRadius:10, cursor:"pointer", fontWeight:700, fontSize:13,
+              }}>✓ إضافة</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── CONFIRM DELETE VEHICLE ── */}
+      {confirmDeleteVehicle !== null && (
+        <div style={{
+          position:"fixed", inset:0, background:"rgba(0,0,0,0.85)", zIndex:400,
+          display:"flex", alignItems:"center", justifyContent:"center",
+          backdropFilter:"blur(8px)", padding:"0 20px",
+        }} onClick={() => setConfirmDeleteVehicle(null)}>
+          <div style={{
+            background:"#252d3f", borderRadius:20, padding:"24px 20px",
+            width:"100%", maxWidth:320, direction:"rtl",
+            boxShadow:"0 20px 60px #000c", textAlign:"center",
+          }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize:36, marginBottom:12 }}>🚗</div>
+            <div style={{ color:"#e8ecf1", fontSize:15, fontWeight:700, marginBottom:6 }}>حذف المركبة؟</div>
+            <div style={{ color:"#5a6678", fontSize:12, marginBottom:20 }}>
+              {vehicles.find(v => v.id===confirmDeleteVehicle)?.name}
+            </div>
+            <div style={{ display:"flex", gap:8 }}>
+              <button onClick={() => setConfirmDeleteVehicle(null)} style={{
+                flex:1, padding:"11px", border:"1px solid #2d3550",
+                background:"#222840", color:"#7a8799", borderRadius:10,
+                cursor:"pointer", fontWeight:700, fontSize:13,
+              }}>إلغاء</button>
+              <button onClick={() => { delVehicle(confirmDeleteVehicle); setConfirmDeleteVehicle(null); }} style={{
+                flex:1, padding:"11px", border:"none",
+                background:"linear-gradient(135deg,#FF4B2B,#FF6B4A)",
+                color:"#fff", borderRadius:10, cursor:"pointer", fontWeight:700, fontSize:13,
+              }}>✓ حذف</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── SETTINGS ── */}
+      {modal === "settings" && (
+        <Sheet title="الإعدادات" onClose={() => setModal(null)}>
+          <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+
+            {/* Squad Selector */}
+            <div style={{ background:"#161b27", borderRadius:14, padding:16, border:"1px solid #1a2035" }}>
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:14 }}>
+                <span style={{ fontSize:18 }}>🎯</span>
+                <div>
+                  <div style={{ color:"#e8ecf1", fontSize:14, fontWeight:700 }}>اختيار الفصيلة</div>
+                  <div style={{ color:"#5a6678", fontSize:11 }}>
+                    {manualSquad ? "وضع يدوي — الفصيلة محددة يدوياً" : "وضع تلقائي — حسب نظام 24/48"}
+                  </div>
+                </div>
+                {manualSquad && (
+                  <button onClick={() => { setManualSquad(null); setDate(new Date()); }} className="tap" style={{
+                    marginRight:"auto", background:"#222840", border:"1px solid #2d3550",
+                    color:"#7a8799", borderRadius:20, padding:"4px 12px",
+                    cursor:"pointer", fontSize:10, fontWeight:700,
+                  }}>↺ تلقائي</button>
+                )}
+              </div>
+
+              <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+                {SQUADS.map(sq => {
+                  const c = SQUAD_COLORS[sq];
+                  const isSelected = manualSquad === sq;
+                  return (
+                    <button key={sq} className="tap" onClick={() => {
+                      setManualSquad(sq);
+                      setDate(getNearestDutyDate(sq));
+                    }} style={{
+                      background: isSelected ? `linear-gradient(135deg,${c.bg}22,${c.bg}10)` : "#1e2535",
+                      border: isSelected ? `2px solid ${c.bg}` : "2px solid #1a2035",
+                      borderRadius:12, padding:"12px 14px",
+                      display:"flex", alignItems:"center", gap:12,
+                      cursor:"pointer", textAlign:"right", width:"100%", transition:"all .25s",
+                    }}>
+                      <Badge sq={sq} size="md"/>
+                      <div style={{ flex:1 }}>
+                        <div style={{ color:"#e8ecf1", fontWeight:700, fontSize:14 }}>{SQUAD_NAMES[sq]}</div>
+                        <div style={{ color:"#5a6678", fontSize:11 }}>{personnel[sq].length} فرد مسجل</div>
+                      </div>
+                      {isSelected && (
+                        <div style={{
+                          background:`${c.bg}25`, border:`1px solid ${c.bg}60`,
+                          color:c.light, padding:"3px 10px", borderRadius:20, fontSize:10, fontWeight:700,
+                        }}>✓ محددة</div>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div style={{
+                marginTop:12, background:"#252d3f", borderRadius:10,
+                padding:"9px 12px", border:"1px solid #1a2035",
+                display:"flex", alignItems:"center", gap:8,
+              }}>
+                <span style={{ fontSize:14 }}>💡</span>
+                <div style={{ color:"#5a6678", fontSize:11, lineHeight:1.6 }}>
+                  عند تحديد فصيلة، يتنقل التاريخ بـ 3 أيام (يوم مداومتها فقط).
+                </div>
+              </div>
+            </div>
+
+            {/* Shift Info */}
+            <div style={{ background:"#252d3f", borderRadius:12, padding:14, border:"1px solid #1a2035" }}>
+              <div style={{ color:"#5a6678", fontSize:11, marginBottom:8 }}>نظام الدوام</div>
+              <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+                <span style={{ fontSize:28 }}>⏱</span>
+                <div>
+                  <div style={{ color:"#e8ecf1", fontSize:13, fontWeight:700 }}>24 ساعة عمل / 48 ساعة راحة</div>
+                  <div style={{ color:"#5a6678", fontSize:11 }}>A: 14/03 · B: 15/03 · C: 16/03</div>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        </Sheet>
+      )}
+      {modal === "stats" && (
+        <Sheet title="إحصاء الفصيلة" onClose={() => setModal(null)}>
+          {(() => {
+            const sq = manualSquad || autoSquad;
+            const members = personnel[sq] || [];
+            const vd2 = new Date(date); vd2.setHours(0,0,0,0);
+            const curShift = Math.floor(vd2.getTime()/(86400000*3));
+
+            let total=0, present=0, absent=0, vacation=0, compensatory=0;
+            const vacList=[], absentList=[], compList=[];
+
+            members.forEach(p => {
+              total++;
+              const s = attendance[p.id];
+              if (s === false) {
+                absent++;
+                absentList.push(p.name);
+              } else if (s && s.vacation) {
+                const endShift = s.startShift + Math.ceil(s.days/3);
+                if (curShift < endShift) {
+                  const remaining = (endShift - curShift) * 3;
+                  if (s.days === 3) {
+                    compensatory++;
+                    compList.push({ name:p.name, remaining });
+                  } else {
+                    vacation++;
+                    vacList.push({ name:p.name, remaining, total:s.days });
+                  }
+                } else {
+                  present++;
+                }
+              } else {
+                present++;
+              }
+            });
+
+            const StatRow = ({ label, value, color, icon }) => (
+              <div style={{
+                display:"flex", alignItems:"center", gap:10,
+                background:"rgba(255,255,255,0.03)", borderRadius:10,
+                padding:"11px 14px", border:"1px solid rgba(255,255,255,0.06)",
+                marginBottom:8,
+              }}>
+                <span style={{ fontSize:18 }}>{icon}</span>
+                <span style={{ flex:1, color:"#c5cdd8", fontSize:13, fontWeight:600 }}>{label}</span>
+                <span style={{ color, fontSize:22, fontWeight:900 }}>{value}</span>
+              </div>
+            );
+
+            const PersonList = ({ list, color, renderItem }) => list.length > 0 ? (
+              <div style={{ marginBottom:14 }}>
+                {list.map((item,i) => (
+                  <div key={i} style={{
+                    background:"rgba(255,255,255,0.02)", borderRadius:8,
+                    padding:"7px 12px", marginBottom:5,
+                    border:`1px solid ${color}22`,
+                    borderRight:`3px solid ${color}`,
+                    display:"flex", alignItems:"center", justifyContent:"space-between",
+                  }}>
+                    {renderItem(item)}
+                  </div>
+                ))}
+              </div>
+            ) : null;
+
+            return (
+              <div style={{ padding:"4px 0" }}>
+                {/* Summary */}
+                <StatRow label="إجمالي الأفراد"   value={total}       color="#c5cdd8"  icon="👥"/>
+                <StatRow label="الحاضرون"          value={present}     color="#00D97E"  icon="✅"/>
+                <StatRow label="الغائبون"          value={absent}      color="#E74C3C"  icon="🔴"/>
+                <StatRow label="في عطلة"           value={vacation}    color="#F39C12"  icon="🏖️"/>
+                <StatRow label="إجازة تعويضية"     value={compensatory}color="#9B59B6"  icon="🎁"/>
+
+                {/* Absent list */}
+                {absentList.length > 0 && (
+                  <>
+                    <div style={{ color:"#E74C3C", fontSize:11, fontWeight:700, marginBottom:6, marginTop:14 }}>🔴 الغائبون</div>
+                    <PersonList list={absentList} color="#E74C3C" renderItem={name => (
+                      <span style={{ color:"#e2e8f0", fontSize:12, fontWeight:600 }}>{name}</span>
+                    )}/>
+                  </>
+                )}
+
+                {/* Vacation list */}
+                {vacList.length > 0 && (
+                  <>
+                    <div style={{ color:"#F39C12", fontSize:11, fontWeight:700, marginBottom:6, marginTop:14 }}>🏖️ في عطلة</div>
+                    <PersonList list={vacList} color="#F39C12" renderItem={item => (
+                      <>
+                        <span style={{ color:"#e2e8f0", fontSize:12, fontWeight:600 }}>{item.name}</span>
+                        <span style={{ color:"#F39C12", fontSize:11, fontWeight:700 }}>متبقي {item.remaining} يوم</span>
+                      </>
+                    )}/>
+                  </>
+                )}
+
+                {/* Compensatory list */}
+                {compList.length > 0 && (
+                  <>
+                    <div style={{ color:"#9B59B6", fontSize:11, fontWeight:700, marginBottom:6, marginTop:14 }}>🎁 إجازة تعويضية</div>
+                    <PersonList list={compList} color="#9B59B6" renderItem={item => (
+                      <>
+                        <span style={{ color:"#e2e8f0", fontSize:12, fontWeight:600 }}>{item.name}</span>
+                        <span style={{ color:"#9B59B6", fontSize:11, fontWeight:700 }}>3 أيام</span>
+                      </>
+                    )}/>
+                  </>
+                )}
+              </div>
+            );
+          })()}
+        </Sheet>
+      )}
+
+      </div>{/* end z-index wrapper */}
+
+      {/* ── Attendance Status Popup ── */}
+      {attPopup && (
+        <div onClick={() => setAttPopup(null)} style={{
+          position:"fixed", inset:0, zIndex:9999, background:"transparent",
+        }}>
+          <div onClick={e => e.stopPropagation()} style={{
+            position:"fixed",
+            top: attPopup.top,
+            left:"50%", transform:"translateX(-50%)",
+            width:180,
+            background:"#0d111b",
+            border:"1px solid rgba(255,255,255,0.12)",
+            borderRadius:12,
+            padding:"8px",
+            boxShadow:"0 8px 32px #000a",
+            zIndex:10000,
+          }}>
+            {/* Present */}
+            <button onClick={() => {
+              setStatus(attPopup.id, true);
+              setAttPopup(null);
+            }} style={{
+              width:"100%", padding:"7px 10px", borderRadius:8, marginBottom:5,
+              background: getStatus(attPopup.id)==="present" ? "#00B86B33" : "rgba(255,255,255,0.04)",
+              border:`1px solid ${getStatus(attPopup.id)==="present" ? "#00B86B66" : "rgba(255,255,255,0.08)"}`,
+              color: getStatus(attPopup.id)==="present" ? "#00D97E" : "#e2e8f0",
+              cursor:"pointer", fontSize:11, fontWeight:700, textAlign:"right", display:"flex", alignItems:"center", gap:6,
+            }}>
+              <span>✅</span> حاضر
+            </button>
+
+            {/* Absent */}
+            <button onClick={() => {
+              setStatus(attPopup.id, false);
+              setAttPopup(null);
+            }} style={{
+              width:"100%", padding:"7px 10px", borderRadius:8, marginBottom:5,
+              background: getStatus(attPopup.id)==="absent" ? "#E74C3C33" : "rgba(255,255,255,0.04)",
+              border:`1px solid ${getStatus(attPopup.id)==="absent" ? "#E74C3C66" : "rgba(255,255,255,0.08)"}`,
+              color: getStatus(attPopup.id)==="absent" ? "#E74C3C" : "#e2e8f0",
+              cursor:"pointer", fontSize:11, fontWeight:700, textAlign:"right", display:"flex", alignItems:"center", gap:6,
+            }}>
+              <span>🔴</span> غائب
+            </button>
+
+            {/* Vacation */}
+            <div style={{
+              background: getStatus(attPopup.id)==="vacation" ? "#F39C1222" : "rgba(255,255,255,0.03)",
+              border:`1px solid ${getStatus(attPopup.id)==="vacation" ? "#F39C1244" : "rgba(255,255,255,0.08)"}`,
+              borderRadius:8, padding:"7px 10px",
+            }}>
+              <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:6 }}>
+                <span>🏖️</span>
+                <span style={{ color: getStatus(attPopup.id)==="vacation" ? "#F39C12" : "#e2e8f0", fontSize:11, fontWeight:700, flex:1 }}>عطلة</span>
+              </div>
+              {/* Days counter */}
+              <div style={{ display:"flex", alignItems:"center", gap:6, justifyContent:"center", marginBottom:6 }}>
+                <button onClick={() => setVacDays(d => Math.max(3, d-3))} style={{
+                  width:24, height:24, borderRadius:6, background:"rgba(255,255,255,0.06)",
+                  border:"1px solid rgba(255,255,255,0.1)", color:"#e2e8f0",
+                  cursor:"pointer", fontSize:14, fontWeight:700, display:"flex", alignItems:"center", justifyContent:"center",
+                }}>−</button>
+                <div style={{ textAlign:"center", minWidth:50 }}>
+                  <div style={{ color:"#F39C12", fontSize:18, fontWeight:900, lineHeight:1 }}>{vacDays}</div>
+                  <div style={{ color:"#5a6678", fontSize:8 }}>{Math.ceil(vacDays/3)} وردية</div>
+                </div>
+                <button onClick={() => setVacDays(d => Math.min(180, d+3))} style={{
+                  width:24, height:24, borderRadius:6, background:"rgba(255,255,255,0.06)",
+                  border:"1px solid rgba(255,255,255,0.1)", color:"#e2e8f0",
+                  cursor:"pointer", fontSize:14, fontWeight:700, display:"flex", alignItems:"center", justifyContent:"center",
+                }}>+</button>
+              </div>
+              <button onClick={() => {
+                const vd2 = new Date(date); vd2.setHours(0,0,0,0);
+                const startShift = Math.floor(vd2.getTime()/(86400000*3));
+                setStatus(attPopup.id, { vacation:true, startShift, days:vacDays });
+                setAttPopup(null);
+              }} style={{
+                width:"100%", padding:"5px", borderRadius:7,
+                background:"#F39C1233", border:"1px solid #F39C1266",
+                color:"#F39C12", cursor:"pointer", fontSize:10, fontWeight:700,
+              }}>
+                ✓ {vacDays}ي ({Math.ceil(vacDays/3)} وردية)
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+function PinScreen({ onUnlock }) {
+  const PIN = "102114";
+  const [pin,      setPin]      = useState("");
+  const [pinError, setPinError] = useState(false);
+
+  const handlePin = (digit) => {
+    if (pinError) { setPin(""); setPinError(false); }
+    const next = pin + digit;
+    setPin(next);
+    if (next.length === PIN.length) {
+      if (next === PIN) {
+        localStorage.setItem('koudja_auth','1');
+        onUnlock();
+      } else {
+        setPinError(true);
+        setTimeout(() => { setPin(""); setPinError(false); }, 900);
+      }
+    }
+  };
+
+  return (
+    <div style={{
+      position:"fixed", inset:0,
+      background:"linear-gradient(170deg,#0d111b 0%,#111827 60%,#0d1520 100%)",
+      display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center",
+      fontFamily:"'Cairo',sans-serif",
+    }}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&display=swap');`}</style>
+      <div style={{ marginBottom:32, textAlign:"center" }}>
+        <div style={{ fontSize:11, color:"#3a4459", letterSpacing:5, marginBottom:6, fontWeight:600 }}>الحماية المدنية</div>
+
+        <div style={{ fontSize:10, color:"#3a4459", marginTop:4, letterSpacing:2 }}>نظام إدارة العمليات</div>
+      </div>
+      <div style={{ display:"flex", gap:14, marginBottom:32 }}>
+        {Array.from({length: PIN.length}).map((_,i) => (
+          <div key={i} style={{
+            width:14, height:14, borderRadius:"50%",
+            background: pinError ? "#E74C3C" : i < pin.length ? "#C0392B" : "rgba(255,255,255,0.12)",
+            border:`1px solid ${pinError ? "#E74C3C66" : i < pin.length ? "#C0392B88" : "rgba(255,255,255,0.15)"}`,
+            transition:"all .2s",
+            boxShadow: i < pin.length && !pinError ? "0 0 8px #C0392B66" : "none",
+          }}/>
+        ))}
+      </div>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10, width:220 }}>
+        {[1,2,3,4,5,6,7,8,9,"",0,"⌫"].map((d,i) => (
+          <button key={i} onClick={() => d === "⌫" ? setPin(p=>p.slice(0,-1)) : d !== "" ? handlePin(String(d)) : null}
+            disabled={d === ""}
+            style={{
+              height:58, borderRadius:14,
+              background: d === "" ? "transparent" : d === "⌫" ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.06)",
+              border: d === "" ? "none" : "1px solid rgba(255,255,255,0.08)",
+              color: d === "⌫" ? "#5a6678" : "#e2e8f0",
+              fontSize: d === "⌫" ? 18 : 22, fontWeight:700,
+              cursor: d === "" ? "default" : "pointer",
+              fontFamily:"'Cairo',sans-serif",
+            }}
+          >{d}</button>
+        ))}
+      </div>
+      {pinError && <div style={{ marginTop:20, color:"#E74C3C", fontSize:11, fontWeight:700 }}>رمز خاطئ ، حاول مرة أخرى</div>}
+    </div>
+  );
+}
+
+function App() {
+  const [unlocked, setUnlocked] = useState(() => localStorage.getItem('koudja_auth') === '1');
+  if (!unlocked) return <PinScreen onUnlock={() => setUnlocked(true)} />;
+  return <MainApp />;
+}
+
+    const root=ReactDOM.createRoot(document.getElementById('root'));
+    root.render(React.createElement(App));
+    document.getElementById('loading').style.display='none';
+  </script>
+</body>
+</html>
